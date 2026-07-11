@@ -14,10 +14,12 @@ depends:
 contents:
   - src: dist/${GOARCH}/clash-web
     dst: /usr/bin/clash-web
+    expand: true
     file_info:
       mode: 0755
   - src: dist/${GOARCH}/mihomo
     dst: /usr/lib/clash-web/mihomo
+    expand: true
     file_info:
       mode: 0755
   - src: packaging/config.yaml
@@ -31,8 +33,10 @@ contents:
     dst: /usr/share/doc/clash-web/LICENSE
   - src: dist/${GOARCH}/mihomo-LICENSE
     dst: /usr/share/doc/clash-web/mihomo-LICENSE
+    expand: true
   - src: dist/${GOARCH}/BUILD-INFO
     dst: /usr/share/doc/clash-web/BUILD-INFO
+    expand: true
 scripts:
   postinstall: packaging/scripts/postinstall.sh
   preremove: packaging/scripts/preremove.sh
