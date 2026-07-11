@@ -8,6 +8,7 @@ install -d -o clash-web -g clash-web -m 0750 \
   /var/lib/clash-web/profiles \
   /var/lib/clash-web/versions
 install -d -o root -g clash-web -m 0750 /run/clash-web
+install -d -o root -g clash-web -m 0750 /var/lib/clash-web/runtime
 
 # Keep the privileged supervisor in the clash-web group so both Unix sockets
 # are reachable by the unprivileged web process. dumb-init forwards shutdown

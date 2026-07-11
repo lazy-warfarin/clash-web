@@ -9,6 +9,7 @@ if ! getent passwd clash-web >/dev/null 2>&1; then
 fi
 
 install -d -o clash-web -g clash-web -m 0750 /var/lib/clash-web /var/lib/clash-web/profiles /var/lib/clash-web/versions
+install -d -o root -g clash-web -m 0750 /var/lib/clash-web/runtime
 install -d -o root -g clash-web -m 0750 /run/clash-web
 chown root:root /usr/lib/clash-web/mihomo
 chmod 0755 /usr/lib/clash-web/mihomo

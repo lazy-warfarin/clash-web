@@ -66,7 +66,10 @@ func fetchSubscription(ctx context.Context, rawURL string, allowPrivate bool) (s
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "clash-web/1")
+	// Subscription providers commonly use the User-Agent to choose the output
+	// format. Identify the compatible core so providers return a mihomo/Clash
+	// configuration instead of a generic or legacy client payload.
+	req.Header.Set("User-Agent", "Clash.Meta")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

@@ -25,7 +25,7 @@ func DefaultConfig() Config {
 	if runtime.GOOS == "windows" {
 		return Config{Listen: "127.0.0.1:8080", DataDir: "data", RuntimeDir: "data/run", MihomoBinary: "mihomo.exe", MihomoController: "http://127.0.0.1:9090", HelperSocket: "tcp://127.0.0.1:9088"}
 	}
-	return Config{Listen: "0.0.0.0:8080", DataDir: "/var/lib/clash-web", RuntimeDir: "/run/clash-web", MihomoBinary: "/usr/lib/clash-web/mihomo", MihomoController: "unix:///run/clash-web/mihomo.sock", HelperSocket: "unix:///run/clash-web/helper.sock"}
+	return Config{Listen: "0.0.0.0:8080", DataDir: "/var/lib/clash-web", RuntimeDir: "/var/lib/clash-web/runtime", MihomoBinary: "/usr/lib/clash-web/mihomo", MihomoController: "unix:///run/clash-web/mihomo.sock", HelperSocket: "unix:///run/clash-web/helper.sock"}
 }
 
 func LoadConfig(path string) (Config, error) {

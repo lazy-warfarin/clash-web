@@ -81,6 +81,12 @@ PY
   echo "Created profile $profile_id"
 else
   echo "Reusing profile $profile_id"
+  curl --fail-with-body --silent --show-error \
+    --cookie "$COOKIE_JAR" \
+    --header "X-CSRF-Token: $csrf" \
+    --request POST \
+    "$BASE_URL/api/v1/profiles/$profile_id/refresh" > "$PROFILE_RESPONSE"
+  echo "Refreshed profile $profile_id"
 fi
 
 if ! curl --fail-with-body --silent --show-error \

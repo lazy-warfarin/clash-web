@@ -25,6 +25,7 @@ import (
 
 type manager struct {
 	cfg      app.Config
+	ctx      context.Context
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	done     chan struct{}
@@ -36,7 +37,7 @@ func Run(ctx context.Context, cfg app.Config) error {
 	if err := os.MkdirAll(cfg.RuntimeDir, 0o770); err != nil {
 		return err
 	}
-	m := &manager{cfg: cfg}
+	m := &manager{cfg: cfg, ctx: ctx}
 	r := chi.NewRouter()
 	r.Get("/v1/status", m.status)
 	r.Post("/v1/core/{action}", m.action)
@@ -49,6 +50,11 @@ func Run(ctx context.Context, cfg app.Config) error {
 	server := &http.Server{Handler: r, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); _ = server.Shutdown(context.Background()); m.stop() }()
 	log.Printf("privileged helper listening on %s", cfg.HelperSocket)
+	if _, statErr := os.Stat(filepath.Join(cfg.RuntimeDir, "active.yaml")); statErr == nil {
+		if startErr := m.start(); startErr != nil {
+			log.Printf("unable to restore active mihomo configuration: %v", startErr)
+		}
+	}
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -209,8 +215,8 @@ func (m *manager) start() error {
 func (m *manager) wait(cmd *exec.Cmd, done chan struct{}) {
 	err := cmd.Wait()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	close(done)
+	restart := false
 	if m.cmd == cmd {
 		m.cmd = nil
 		m.done = nil
@@ -219,6 +225,20 @@ func (m *manager) wait(cmd *exec.Cmd, done chan struct{}) {
 		} else {
 			m.lastExit = "clean exit"
 		}
+		restart = m.ctx != nil && m.ctx.Err() == nil
+	}
+	m.mu.Unlock()
+	if restart {
+		go func() {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			if err := m.start(); err != nil {
+				log.Printf("unable to restart mihomo after exit: %v", err)
+			}
+		}()
 	}
 }
 func (m *manager) stop() {

@@ -1,6 +1,9 @@
 package app
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"testing"
 )
@@ -22,5 +25,19 @@ func TestValidateYAML(t *testing.T) {
 	}
 	if err := validateYAML(": bad"); err == nil {
 		t.Fatal("invalid YAML accepted")
+	}
+}
+
+func TestFetchSubscriptionRequestsMihomoFormat(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "Clash.Meta" {
+			t.Errorf("unexpected User-Agent %q", got)
+		}
+		_, _ = w.Write([]byte("proxies: []\nmode: rule\n"))
+	}))
+	defer server.Close()
+
+	if _, err := fetchSubscription(context.Background(), server.URL, true); err != nil {
+		t.Fatal(err)
 	}
 }
