@@ -1,0 +1,11 @@
+.git
+.github
+.cache
+.pnpm-store
+data
+dist
+ui/node_modules
+*.db
+*.db-shm
+*.db-wal
+*.deb

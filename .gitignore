@@ -1,0 +1,10 @@
+/ui/node_modules/
+/.pnpm-store/
+/internal/webassets/dist/assets/
+/dist/
+/.cache/
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.deb

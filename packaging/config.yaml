@@ -1,0 +1,8 @@
+listen: 0.0.0.0:8080
+data_dir: /var/lib/clash-web
+runtime_dir: /run/clash-web
+mihomo_binary: /usr/lib/clash-web/mihomo
+mihomo_controller: unix:///run/clash-web/mihomo.sock
+helper_socket: unix:///run/clash-web/helper.sock
+allow_private_subscription_sources: false
+trusted_proxy: false

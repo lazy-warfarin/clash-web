@@ -1,0 +1,38 @@
+name: clash-web
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Clash Web maintainers
+description: Server-native web control plane for the mihomo proxy core
+homepage: https://github.com/maris/clash-web
+license: Apache-2.0
+depends:
+  - ca-certificates
+  - adduser
+contents:
+  - src: dist/${GOARCH}/clash-web
+    dst: /usr/bin/clash-web
+    file_info:
+      mode: 0755
+  - src: dist/${GOARCH}/mihomo
+    dst: /usr/lib/clash-web/mihomo
+    file_info:
+      mode: 0755
+  - src: packaging/config.yaml
+    dst: /etc/clash-web/config.yaml
+    type: config|noreplace
+  - src: packaging/systemd/clash-web.service
+    dst: /lib/systemd/system/clash-web.service
+  - src: packaging/systemd/clash-web-helper.service
+    dst: /lib/systemd/system/clash-web-helper.service
+  - src: LICENSE
+    dst: /usr/share/doc/clash-web/LICENSE
+  - src: dist/${GOARCH}/mihomo-LICENSE
+    dst: /usr/share/doc/clash-web/mihomo-LICENSE
+  - src: dist/${GOARCH}/BUILD-INFO
+    dst: /usr/share/doc/clash-web/BUILD-INFO
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh

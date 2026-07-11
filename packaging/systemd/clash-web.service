@@ -1,0 +1,25 @@
+[Unit]
+Description=Clash Web server console
+After=network-online.target clash-web-helper.service
+Wants=network-online.target clash-web-helper.service
+
+[Service]
+Type=simple
+User=clash-web
+Group=clash-web
+UMask=0027
+ExecStart=/usr/bin/clash-web serve --config /etc/clash-web/config.yaml
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/clash-web /run/clash-web
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
