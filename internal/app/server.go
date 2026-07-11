@@ -76,11 +76,11 @@ func New(cfg Config, version string) (*Server, error) {
 		}
 		log.Printf("first-run administrator password written to %s", filepath.Join(cfg.DataDir, "bootstrap-password"))
 	}
-	mClient, mBase, err := socketHTTPClient(cfg.MihomoController)
+	mClient, mBase, err := socketHTTPClient(cfg.MihomoController, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	hClient, hBase, err := socketHTTPClient(cfg.HelperSocket)
+	hClient, hBase, err := socketHTTPClient(cfg.HelperSocket, 2*time.Minute)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +517,7 @@ func (s *Server) request(client *http.Client, method, target string, body io.Rea
 	return data, resp.StatusCode, err
 }
 
-func socketHTTPClient(endpoint string) (*http.Client, string, error) {
+func socketHTTPClient(endpoint string, timeout time.Duration) (*http.Client, string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, "", err
@@ -533,7 +533,7 @@ func socketHTTPClient(endpoint string) (*http.Client, string, error) {
 	} else if u.Scheme == "tcp" {
 		base = "http://" + u.Host
 	}
-	return &http.Client{Transport: transport, Timeout: 15 * time.Second}, strings.TrimSuffix(base, "/"), nil
+	return &http.Client{Transport: transport, Timeout: timeout}, strings.TrimSuffix(base, "/"), nil
 }
 
 func spaHandler() http.Handler {

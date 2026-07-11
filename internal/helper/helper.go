@@ -174,7 +174,7 @@ func (m *manager) prepare(data []byte) ([]byte, error) {
 	return yaml.Marshal(doc)
 }
 func (m *manager) validate(file string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.cfg.MihomoBinary, "-t", "-d", m.cfg.RuntimeDir, "-f", file)
 	output, err := cmd.CombinedOutput()
