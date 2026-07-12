@@ -149,9 +149,11 @@ function ProxiesPage({ online }: { online?: boolean }) {
   const records = proxies.data?.proxies || {}
   const groups = Object.values(records).filter((p: any) => Array.isArray(p.all)) as any[]
   return <Stack spacing={2}><PageTools title={`${groups.length} 个代理组`} query={query} setQuery={setQuery} action={<Button startIcon={<SpeedRounded />} onClick={() => qc.invalidateQueries({ queryKey: ['proxies'] })}>刷新状态</Button>} />
+    {select.error && <Alert severity="error">{(select.error as Error).message}</Alert>}
     <Box className="proxy-grid">{groups.filter(g => g.name.toLowerCase().includes(query.toLowerCase()) || g.all.some((n: string) => n.toLowerCase().includes(query.toLowerCase()))).map(group => <Card key={group.name} className="proxy-group"><CardContent>
       <Stack direction="row" justifyContent="space-between"><Box><Typography variant="h6">{group.name}</Typography><Typography variant="caption" color="text.secondary">{group.type} · {group.all.length} nodes</Typography></Box><Chip size="small" label={group.now || '未选择'} color="primary" variant="outlined" /></Stack>
-      <Divider sx={{ my: 2 }} /><Box className="node-list">{group.all.map((name: string) => { const node = records[name] || {}; const delay = node.history?.at(-1)?.delay; return <Button key={name} className={group.now === name ? 'node active' : 'node'} onClick={() => select.mutate({ group: group.name, name })}><span>{name}</span><small>{delay ? `${delay} ms` : node.type || '—'}</small></Button> })}</Box>
+      {String(group.type).toLowerCase() !== 'selector' && <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>该组由 mihomo 自动选择，节点状态仅供查看。</Alert>}
+      <Divider sx={{ my: 2 }} /><Box className="node-list">{group.all.map((name: string) => { const node = records[name] || {}; const delay = node.history?.at(-1)?.delay; const selectable = String(group.type).toLowerCase() === 'selector'; return <Button key={name} disabled={!selectable || select.isPending} className={group.now === name ? 'node active' : 'node'} onClick={() => select.mutate({ group: group.name, name })}><span>{name}</span><small>{delay ? `${delay} ms` : node.type || '—'}</small></Button> })}</Box>
     </CardContent></Card>)}</Box>
     {!groups.length && <EmptyGuide title="没有代理组" detail="当前配置没有可选择的策略组。" />}
   </Stack>
@@ -212,14 +214,177 @@ function TestPage({ online }: { online?: boolean }) {
 }
 
 function SettingsPage({ status }: { status?: Status }) {
-  const qc = useQueryClient(); const config = status?.config || {}; const [mode, setMode] = useState(String(config.mode || 'rule')); const [tun, setTun] = useState(Boolean(config.tun?.enable)); const [passwords, setPasswords] = useState({ current: '', password: '' }); const [notice, setNotice] = useState('')
-  useEffect(() => { setMode(String(config.mode || 'rule').toLowerCase()); setTun(Boolean(config.tun?.enable)) }, [status?.config])
-  const saveCore = useMutation({ mutationFn: () => api('/config', json('PATCH', { mode, tun: { ...(config.tun || {}), enable: tun } })), onSuccess: () => { qc.invalidateQueries({ queryKey: ['status'] }); setNotice('运行设置已更新') } })
+  const qc = useQueryClient()
+  const config = status?.config || {}
+  const [network, setNetwork] = useState(() => settingsFromConfig(config))
+  const [passwords, setPasswords] = useState({ current: '', password: '' })
+  const [notice, setNotice] = useState('')
+  const [currentConfig, setCurrentConfig] = useState<string | null>(null)
+  const cores = useQuery<CoreList>({ queryKey: ['cores'], queryFn: () => api('/cores'), enabled: !!status?.helperOnline })
+
+  useEffect(() => setNetwork(settingsFromConfig(config)), [status?.config])
+
+  const saveCore = useMutation({
+    mutationFn: () => api('/config', json('PATCH', {
+      mode: network.mode,
+      'allow-lan': network.allowLan,
+      'bind-address': network.bindAddress || '*',
+      ipv6: network.ipv6,
+      'mixed-port': parsePort(network.mixedPort),
+      port: parsePort(network.httpPort),
+      'socks-port': parsePort(network.socksPort),
+      'redir-port': parsePort(network.redirPort),
+      'tproxy-port': parsePort(network.tproxyPort),
+      tun: { ...(config.tun || {}), enable: network.tun },
+      dns: {
+        ...(config.dns || {}),
+        enable: network.dnsEnabled,
+        ipv6: network.dnsIPv6,
+        listen: network.dnsListen,
+        'enhanced-mode': network.dnsMode,
+      },
+    })),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['status'] }); setNotice('网络与 DNS 设置已持久化') },
+  })
+  const selectCore = useMutation({
+    mutationFn: (id: string) => api('/cores/select', json('POST', { id })),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['cores'] }); qc.invalidateQueries({ queryKey: ['status'] }); setNotice('mihomo 内核已切换') },
+  })
+  const updateCore = useMutation({
+    mutationFn: () => api('/cores/update', json('POST', { select: true })),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['cores'] }); qc.invalidateQueries({ queryKey: ['status'] }); setNotice('官方稳定版内核已校验、安装并启用') },
+  })
+  const updateGeoData = useMutation({
+    mutationFn: () => api('/geodata/update', json('POST', {})),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['status'] }); setNotice('GeoData 已校验更新，内核已重启') },
+  })
+  const openCurrentConfig = async () => {
+    try {
+      const result = await api<{ content: string }>('/current-config')
+      setCurrentConfig(result.content)
+    } catch (error) { setNotice((error as Error).message) }
+  }
+  const saveCurrentConfig = async () => {
+    if (currentConfig == null) return
+    try {
+      await api('/current-config', { method: 'PUT', body: currentConfig, headers: { 'Content-Type': 'application/yaml' } })
+      setCurrentConfig(null)
+      await qc.invalidateQueries({ queryKey: ['status'] })
+      setNotice('当前配置已验证并重新加载')
+    } catch (error) { setNotice((error as Error).message) }
+  }
   const changePassword = useMutation({ mutationFn: () => api('/auth/password', json('POST', passwords)), onSuccess: () => { setPasswords({ current: '', password: '' }); qc.invalidateQueries({ queryKey: ['me'] }); setNotice('管理员密码已更新') } })
-  return <Stack spacing={2}><Box className="settings-grid"><Card><CardContent><SectionTitle icon={<TuneRounded />} title="内核运行" detail="直接更新当前 mihomo 运行配置。"/><Divider sx={{ my: 2 }}/><Stack spacing={2.5}><FormControl fullWidth><InputLabel>代理模式</InputLabel><Select value={mode} label="代理模式" onChange={e => setMode(e.target.value)}><MenuItem value="rule">Rule</MenuItem><MenuItem value="global">Global</MenuItem><MenuItem value="direct">Direct</MenuItem></Select></FormControl><Stack direction="row" justifyContent="space-between"><Box><Typography>TUN 主机路由</Typography><Typography variant="caption" color="text.secondary">让服务器流量进入 mihomo 虚拟网卡</Typography></Box><Switch checked={tun} onChange={e => setTun(e.target.checked)} /></Stack><Button variant="contained" onClick={() => saveCore.mutate()} disabled={!status?.coreOnline}>保存运行设置</Button></Stack></CardContent></Card>
-    <Card><CardContent><SectionTitle icon={<LockResetRounded />} title="管理员密码" detail="修改后当前会话保持有效。"/><Divider sx={{ my: 2 }}/><Stack spacing={2}><TextField label="当前密码" type="password" value={passwords.current} onChange={e => setPasswords(v => ({ ...v, current: e.target.value }))}/><TextField label="新密码" type="password" helperText="至少 12 个字符" value={passwords.password} onChange={e => setPasswords(v => ({ ...v, password: e.target.value }))}/>{changePassword.error && <Alert severity="error">{(changePassword.error as Error).message}</Alert>}<Button variant="outlined" onClick={() => changePassword.mutate()} disabled={!passwords.current || passwords.password.length < 12}>更新密码</Button></Stack></CardContent></Card>
-    <Card><CardContent><SectionTitle icon={<PowerSettingsNewRounded />} title="服务信息" detail="由 systemd 管理的双服务状态。"/><Divider sx={{ my: 2 }}/><InfoRow label="Web 版本" value={status?.appVersion || '—'}/><InfoRow label="监听地址" value={status?.webListen || '—'}/><InfoRow label="内核版本" value={status?.core?.version || '—'}/><InfoRow label="Helper" value={status?.helperOnline ? 'Connected' : 'Offline'}/><InfoRow label="PID" value={String(status?.helper?.pid || '—')}/></CardContent></Card>
-    <Card><CardContent><SectionTitle icon={<ShieldRounded />} title="安全边界" detail="Controller 只通过本机 Unix Socket 提供。"/><Divider sx={{ my: 2 }}/><Alert severity="info" variant="outlined">公网部署请在前方配置 HTTPS 反向代理。不要直接暴露 mihomo Controller。</Alert><Stack direction="row" spacing={1} sx={{ mt: 2 }}><Chip label="SameSite session"/><Chip label="Origin protected"/><Chip label="SSRF guarded"/></Stack></CardContent></Card></Box><Snackbar open={!!notice} autoHideDuration={2500} onClose={() => setNotice('')} message={notice}/></Stack>
+  const maintenanceError = selectCore.error || updateCore.error || updateGeoData.error || saveCore.error
+
+  return <Stack spacing={2}>
+    <Box className="settings-grid">
+      <Card><CardContent>
+        <SectionTitle icon={<LanRounded />} title="局域网与运行模式" detail="设置 Clash 监听范围、IPv6 与服务器 TUN。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Stack spacing={2.5}>
+          <FormControl fullWidth><InputLabel>代理模式</InputLabel><Select value={network.mode} label="代理模式" onChange={e => setNetwork(v => ({ ...v, mode: e.target.value }))}><MenuItem value="rule">Rule</MenuItem><MenuItem value="global">Global</MenuItem><MenuItem value="direct">Direct</MenuItem></Select></FormControl>
+          <SettingSwitch title="允许局域网连接" detail="允许其他内网设备使用本机 Clash 端口" checked={network.allowLan} onChange={allowLan => setNetwork(v => ({ ...v, allowLan }))}/>
+          <TextField label="绑定地址" value={network.bindAddress} disabled={!network.allowLan} helperText="* 表示所有网卡；关闭局域网连接时仅本机可用" onChange={e => setNetwork(v => ({ ...v, bindAddress: e.target.value }))}/>
+          <SettingSwitch title="IPv6" detail="允许 mihomo 解析与建立 IPv6 连接" checked={network.ipv6} onChange={ipv6 => setNetwork(v => ({ ...v, ipv6 }))}/>
+          <SettingSwitch title="TUN 主机路由" detail="让服务器流量进入 mihomo 虚拟网卡" checked={network.tun} onChange={tun => setNetwork(v => ({ ...v, tun }))}/>
+        </Stack>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<DeviceHubRounded />} title="端口设置" detail="填 0 可关闭对应的独立监听端口。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Box className="port-grid">
+          <PortField label="混合端口" value={network.mixedPort} onChange={mixedPort => setNetwork(v => ({ ...v, mixedPort }))}/>
+          <PortField label="HTTP 端口" value={network.httpPort} onChange={httpPort => setNetwork(v => ({ ...v, httpPort }))}/>
+          <PortField label="SOCKS 端口" value={network.socksPort} onChange={socksPort => setNetwork(v => ({ ...v, socksPort }))}/>
+          <PortField label="Redirect 端口" value={network.redirPort} onChange={redirPort => setNetwork(v => ({ ...v, redirPort }))}/>
+          <PortField label="TProxy 端口" value={network.tproxyPort} onChange={tproxyPort => setNetwork(v => ({ ...v, tproxyPort }))}/>
+        </Box>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<DnsRounded />} title="DNS 覆写" detail="由 mihomo 接管 DNS，并选择 Fake-IP 或 Redir-Host。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Stack spacing={2.5}>
+          <SettingSwitch title="启用 DNS 覆写" detail="关闭后使用配置或系统原有的 DNS 路径" checked={network.dnsEnabled} onChange={dnsEnabled => setNetwork(v => ({ ...v, dnsEnabled }))}/>
+          <SettingSwitch title="DNS IPv6" detail="允许 DNS 返回 AAAA 记录" checked={network.dnsIPv6} onChange={dnsIPv6 => setNetwork(v => ({ ...v, dnsIPv6 }))}/>
+          <TextField label="DNS 监听地址" value={network.dnsListen} onChange={e => setNetwork(v => ({ ...v, dnsListen: e.target.value }))}/>
+          <FormControl fullWidth><InputLabel>增强模式</InputLabel><Select value={network.dnsMode} label="增强模式" onChange={e => setNetwork(v => ({ ...v, dnsMode: e.target.value }))}><MenuItem value="fake-ip">Fake-IP</MenuItem><MenuItem value="redir-host">Redir-Host</MenuItem><MenuItem value="normal">Normal</MenuItem></Select></FormControl>
+        </Stack>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<MemoryRounded />} title="Clash 内核" detail="只从 MetaCubeX 官方稳定版下载并校验 GitHub SHA-256。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Stack spacing={2}>
+          <FormControl fullWidth><InputLabel>当前内核</InputLabel><Select value={cores.data?.selected || status?.helper?.selectedCore || 'bundled'} label="当前内核" onChange={e => selectCore.mutate(String(e.target.value))} disabled={!cores.data?.cores.length}>{(cores.data?.cores || []).map(core => <MenuItem key={core.id} value={core.id}>{core.bundled ? '内置 · ' : ''}{core.id} · {shortCoreVersion(core.version)}</MenuItem>)}</Select></FormControl>
+          <InfoRow label="运行版本" value={status?.core?.version || '—'}/>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <Button variant="outlined" startIcon={<CloudDownloadRounded />} onClick={() => updateCore.mutate()} disabled={updateCore.isPending || !status?.helperOnline}>{updateCore.isPending ? '正在下载并校验…' : '更新到官方稳定版'}</Button>
+            <Button variant="outlined" startIcon={<RefreshRounded />} onClick={() => updateGeoData.mutate()} disabled={updateGeoData.isPending || !status?.coreOnline}>{updateGeoData.isPending ? '正在更新 GeoData…' : '更新 GeoData'}</Button>
+          </Stack>
+          <Alert severity="info" variant="outlined">内置内核始终保留，可随时切回；下载失败不会替换当前运行内核。</Alert>
+        </Stack>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<EditRounded />} title="当前配置" detail="查看 Verge 高级设置中的最终运行 YAML。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>保存前会用当前选中的 mihomo 内核验证；失败时继续使用原配置。</Typography>
+        <Button variant="outlined" startIcon={<EditRounded />} onClick={openCurrentConfig} disabled={!status?.coreOnline}>打开当前配置</Button>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<LockResetRounded />} title="管理员密码" detail="修改后当前会话保持有效。"/>
+        <Divider sx={{ my: 2 }}/>
+        <Stack spacing={2}><TextField label="当前密码" type="password" value={passwords.current} onChange={e => setPasswords(v => ({ ...v, current: e.target.value }))}/><TextField label="新密码" type="password" helperText="至少 12 个字符" value={passwords.password} onChange={e => setPasswords(v => ({ ...v, password: e.target.value }))}/>{changePassword.error && <Alert severity="error">{(changePassword.error as Error).message}</Alert>}<Button variant="outlined" onClick={() => changePassword.mutate()} disabled={!passwords.current || passwords.password.length < 12}>更新密码</Button></Stack>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<PowerSettingsNewRounded />} title="服务信息" detail="由 systemd 管理的双服务状态。"/>
+        <Divider sx={{ my: 2 }}/><InfoRow label="Web 版本" value={status?.appVersion || '—'}/><InfoRow label="监听地址" value={status?.webListen || '—'}/><InfoRow label="内核版本" value={status?.core?.version || '—'}/><InfoRow label="Helper" value={status?.helperOnline ? 'Connected' : 'Offline'}/><InfoRow label="PID" value={String(status?.helper?.pid || '—')}/>
+      </CardContent></Card>
+
+      <Card><CardContent>
+        <SectionTitle icon={<ShieldRounded />} title="安全边界" detail="Controller 只通过本机 Unix Socket 提供。"/>
+        <Divider sx={{ my: 2 }}/><Alert severity="info" variant="outlined">公网部署请在前方配置 HTTPS 反向代理。不要直接暴露 mihomo Controller。</Alert><Stack direction="row" spacing={1} sx={{ mt: 2 }}><Chip label="SameSite session"/><Chip label="Origin protected"/><Chip label="SSRF guarded"/></Stack>
+      </CardContent></Card>
+    </Box>
+    {maintenanceError && <Alert severity="error">{(maintenanceError as Error).message}</Alert>}
+    <Button variant="contained" size="large" startIcon={<TuneRounded />} onClick={() => saveCore.mutate()} disabled={!status?.coreOnline || saveCore.isPending}>保存 Clash 设置</Button>
+    <CurrentConfigDialog content={currentConfig} setContent={setCurrentConfig} onSave={saveCurrentConfig}/>
+    <Snackbar open={!!notice} autoHideDuration={3500} onClose={() => setNotice('')} message={notice}/>
+  </Stack>
+}
+
+type CoreInfo = { id: string; version: string; selected: boolean; bundled: boolean }
+type CoreList = { cores: CoreInfo[]; selected: string }
+type NetworkSettings = {
+  mode: string; allowLan: boolean; bindAddress: string; ipv6: boolean; tun: boolean
+  mixedPort: string; httpPort: string; socksPort: string; redirPort: string; tproxyPort: string
+  dnsEnabled: boolean; dnsIPv6: boolean; dnsListen: string; dnsMode: string
+}
+
+function settingsFromConfig(config: Record<string, any>): NetworkSettings {
+  const port = (value: unknown, fallback = 0) => String(Number.isFinite(Number(value)) ? Number(value) : fallback)
+  return {
+    mode: String(config.mode || 'rule').toLowerCase(), allowLan: Boolean(config['allow-lan']), bindAddress: String(config['bind-address'] || '*'), ipv6: Boolean(config.ipv6), tun: Boolean(config.tun?.enable),
+    mixedPort: port(config['mixed-port'], 7890), httpPort: port(config.port), socksPort: port(config['socks-port']), redirPort: port(config['redir-port']), tproxyPort: port(config['tproxy-port']),
+    dnsEnabled: Boolean(config.dns?.enable), dnsIPv6: Boolean(config.dns?.ipv6), dnsListen: String(config.dns?.listen || '0.0.0.0:1053'), dnsMode: String(config.dns?.['enhanced-mode'] || 'fake-ip'),
+  }
+}
+
+function parsePort(value: string) { const port = Number(value); return Number.isInteger(port) && port >= 0 && port <= 65535 ? port : 0 }
+function shortCoreVersion(value: string) { return value.replace(/^Mihomo Meta\s*/i, '').split(/\s+/).slice(0, 2).join(' ') || 'unknown' }
+function SettingSwitch({ title, detail, checked, onChange }: { title: string; detail: string; checked: boolean; onChange: (checked: boolean) => void }) { return <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}><Box><Typography>{title}</Typography><Typography variant="caption" color="text.secondary">{detail}</Typography></Box><Switch checked={checked} inputProps={{ 'aria-label': title }} onChange={e => onChange(e.target.checked)}/></Stack> }
+function PortField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) { return <TextField label={label} type="number" value={value} inputProps={{ min: 0, max: 65535 }} onChange={e => onChange(e.target.value)}/> }
+
+function CurrentConfigDialog({ content, setContent, onSave }: { content: string | null; setContent: (content: string | null) => void; onSave: () => void }) {
+  return <Dialog open={content != null} onClose={() => setContent(null)} fullScreen>
+    <DialogTitle><Stack direction="row" alignItems="center" spacing={1}><EditRounded/><span>当前运行配置</span><Chip size="small" label="YAML"/></Stack></DialogTitle>
+    <DialogContent sx={{ p: 0 }}>{content != null && <Editor height="calc(100vh - 132px)" defaultLanguage="yaml" theme="vs-dark" value={content} onChange={value => setContent(value || '')} options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, wordWrap: 'on', padding: { top: 18 } }}/>}</DialogContent>
+    <DialogActions><Button onClick={() => setContent(null)}>取消</Button><Button variant="contained" onClick={onSave}>验证并应用</Button></DialogActions>
+  </Dialog>
 }
 
 function ProfileDialog({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: () => void }) {

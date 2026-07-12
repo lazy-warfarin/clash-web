@@ -80,7 +80,7 @@ func New(cfg Config, version string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	hClient, hBase, err := socketHTTPClient(cfg.HelperSocket, 2*time.Minute)
+	hClient, hBase, err := socketHTTPClient(cfg.HelperSocket, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +132,13 @@ func (s *Server) routes() http.Handler {
 				r.Post("/{id}/refresh", s.refreshProfile)
 			})
 			r.Get("/config", s.proxyMihomo("GET", "/configs"))
-			r.Patch("/config", s.proxyMihomo("PATCH", "/configs"))
+			r.Patch("/config", s.proxyHelper("PATCH", "/v1/config/overrides"))
+			r.Get("/current-config", s.proxyHelper("GET", "/v1/config/current"))
+			r.Put("/current-config", s.proxyHelper("PUT", "/v1/config/current"))
+			r.Get("/cores", s.proxyHelper("GET", "/v1/cores"))
+			r.Post("/cores/update", s.proxyHelper("POST", "/v1/cores/update"))
+			r.Post("/cores/select", s.proxyHelper("POST", "/v1/cores/select"))
+			r.Post("/geodata/update", s.proxyHelper("POST", "/v1/geodata/update"))
 			r.Get("/proxies", s.proxyMihomo("GET", "/proxies"))
 			r.Get("/proxies/{name}/delay", s.proxyDynamic("GET", "/proxies/{name}/delay"))
 			r.Put("/proxies/{name}", s.proxyDynamic("PUT", "/proxies/{name}"))
@@ -284,6 +290,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{"appVersion": s.version, "webListen": s.cfg.Listen, "coreOnline": false, "helperOnline": false}
+	config := map[string]any{}
 	if data, code, err := s.request(s.helper, "GET", s.helperBase+"/v1/status", nil, nil); err == nil && code < 400 {
 		var helper any
 		_ = json.Unmarshal(data, &helper)
@@ -297,11 +304,28 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		result["core"] = core
 	}
 	if data, code, err := s.request(s.mihomo, "GET", s.mihomoBase+"/configs", nil, nil); err == nil && code < 400 {
-		var config any
 		_ = json.Unmarshal(data, &config)
-		result["config"] = config
 	}
+	if data, code, err := s.request(s.helper, "GET", s.helperBase+"/v1/config/settings", nil, nil); err == nil && code < 400 {
+		var persisted map[string]any
+		if json.Unmarshal(data, &persisted) == nil {
+			mergeConfigMaps(config, persisted)
+		}
+	}
+	result["config"] = config
 	writeJSON(w, 200, result)
+}
+
+func mergeConfigMaps(target, source map[string]any) {
+	for key, value := range source {
+		if nestedSource, ok := value.(map[string]any); ok {
+			if nestedTarget, ok := target[key].(map[string]any); ok {
+				mergeConfigMaps(nestedTarget, nestedSource)
+				continue
+			}
+		}
+		target[key] = value
+	}
 }
 
 func (s *Server) coreAction(w http.ResponseWriter, r *http.Request) {
@@ -449,14 +473,22 @@ func (s *Server) activateProfile(w http.ResponseWriter, r *http.Request) {
 func (s *Server) proxyMihomo(method, target string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) { s.forwardMihomo(w, r, method, target) }
 }
+func (s *Server) proxyHelper(method, target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := http.MaxBytesReader(w, r.Body, 21<<20)
+		data, code, err := s.request(s.helper, method, s.helperBase+target, body, map[string]string{"Content-Type": r.Header.Get("Content-Type")})
+		proxyResponse(w, data, code, err)
+	}
+}
 func (s *Server) proxyDynamic(method, target string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		resolved := target
 		for _, key := range []string{"name", "id"} {
 			if v := chi.URLParam(r, key); v != "" {
-				target = strings.ReplaceAll(target, "{"+key+"}", url.PathEscape(v))
+				resolved = strings.ReplaceAll(resolved, "{"+key+"}", url.PathEscape(v))
 			}
 		}
-		s.forwardMihomo(w, r, method, target)
+		s.forwardMihomo(w, r, method, resolved)
 	}
 }
 func (s *Server) forwardMihomo(w http.ResponseWriter, r *http.Request, method, target string) {

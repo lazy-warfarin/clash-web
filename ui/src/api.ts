@@ -31,7 +31,7 @@ export type Status = {
   coreOnline: boolean
   helperOnline: boolean
   core?: { version?: string }
-  helper?: { running?: boolean; pid?: number; startedAt?: string; lastExit?: string }
+  helper?: { running?: boolean; pid?: number; startedAt?: string; lastExit?: string; selectedCore?: string }
   config?: Record<string, any>
 }
 export type Profile = {

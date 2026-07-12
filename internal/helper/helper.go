@@ -24,13 +24,14 @@ import (
 )
 
 type manager struct {
-	cfg      app.Config
-	ctx      context.Context
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	done     chan struct{}
-	started  time.Time
-	lastExit string
+	cfg           app.Config
+	ctx           context.Context
+	mu            sync.Mutex
+	maintenanceMu sync.Mutex
+	cmd           *exec.Cmd
+	done          chan struct{}
+	started       time.Time
+	lastExit      string
 }
 
 func Run(ctx context.Context, cfg app.Config) error {
@@ -42,6 +43,14 @@ func Run(ctx context.Context, cfg app.Config) error {
 	r.Get("/v1/status", m.status)
 	r.Post("/v1/core/{action}", m.action)
 	r.Post("/v1/config/validate-activate", m.activate)
+	r.Get("/v1/config/current", m.currentConfig)
+	r.Get("/v1/config/settings", m.currentSettings)
+	r.Put("/v1/config/current", m.updateCurrentConfig)
+	r.Patch("/v1/config/overrides", m.patchConfig)
+	r.Get("/v1/cores", m.cores)
+	r.Post("/v1/cores/update", m.updateCore)
+	r.Post("/v1/cores/select", m.selectCoreHandler)
+	r.Post("/v1/geodata/update", m.updateGeoData)
 	listener, err := listen(cfg.HelperSocket)
 	if err != nil {
 		return err
@@ -85,7 +94,7 @@ func (m *manager) status(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	running := m.cmd != nil && m.cmd.Process != nil
-	write(w, 200, map[string]any{"running": running, "pid": pid(m.cmd), "startedAt": m.started, "lastExit": m.lastExit})
+	write(w, 200, map[string]any{"running": running, "pid": pid(m.cmd), "startedAt": m.started, "lastExit": m.lastExit, "selectedCore": m.selectedCoreID()})
 }
 func (m *manager) action(w http.ResponseWriter, r *http.Request) {
 	switch chi.URLParam(r, "action") {
@@ -120,24 +129,30 @@ func (m *manager) activate(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	if err = m.activatePrepared(prepared); err != nil {
+		write(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, 200, map[string]bool{"ok": true})
+}
+
+func (m *manager) activatePrepared(prepared []byte) error {
+	var err error
 	candidate := filepath.Join(m.cfg.RuntimeDir, "candidate.yaml")
 	active := filepath.Join(m.cfg.RuntimeDir, "active.yaml")
 	backup := filepath.Join(m.cfg.RuntimeDir, "active.previous.yaml")
 	if err = os.WriteFile(candidate, prepared, 0o640); err != nil {
-		write(w, 500, map[string]string{"error": err.Error()})
-		return
+		return err
 	}
 	if err = m.validate(candidate); err != nil {
 		_ = os.Remove(candidate)
-		write(w, 400, map[string]string{"error": err.Error()})
-		return
+		return err
 	}
 	if _, err = os.Stat(active); err == nil {
 		_ = copyFile(active, backup)
 	}
 	if err = os.Rename(candidate, active); err != nil {
-		write(w, 500, map[string]string{"error": err.Error()})
-		return
+		return err
 	}
 	m.stop()
 	if err = m.start(); err != nil {
@@ -145,10 +160,94 @@ func (m *manager) activate(w http.ResponseWriter, r *http.Request) {
 			_ = copyFile(backup, active)
 			_ = m.start()
 		}
-		write(w, 500, map[string]string{"error": "new configuration failed; previous version restored: " + err.Error()})
+		return errors.New("new configuration failed; previous version restored: " + err.Error())
+	}
+	return nil
+}
+
+func (m *manager) currentConfig(w http.ResponseWriter, r *http.Request) {
+	data, err := os.ReadFile(filepath.Join(m.cfg.RuntimeDir, "active.yaml"))
+	if err != nil {
+		write(w, http.StatusNotFound, map[string]string{"error": "no active configuration"})
 		return
 	}
-	write(w, 200, map[string]bool{"ok": true})
+	write(w, http.StatusOK, map[string]string{"content": string(data)})
+}
+
+func (m *manager) currentSettings(w http.ResponseWriter, r *http.Request) {
+	config, err := readYAMLMap(filepath.Join(m.cfg.RuntimeDir, "active.yaml"))
+	if err != nil {
+		write(w, http.StatusNotFound, map[string]string{"error": "no active configuration"})
+		return
+	}
+	result := make(map[string]any)
+	for _, key := range []string{"mode", "allow-lan", "bind-address", "ipv6", "mixed-port", "port", "socks-port", "redir-port", "tproxy-port", "tun", "dns"} {
+		if value, ok := config[key]; ok {
+			result[key] = value
+		}
+	}
+	write(w, http.StatusOK, result)
+}
+
+func (m *manager) updateCurrentConfig(w http.ResponseWriter, r *http.Request) {
+	data, err := io.ReadAll(io.LimitReader(r.Body, (20<<20)+1))
+	if err != nil || len(data) > 20<<20 {
+		write(w, http.StatusBadRequest, map[string]string{"error": "configuration is too large"})
+		return
+	}
+	prepared, err := m.prepare(data)
+	if err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err = m.activatePrepared(prepared); err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (m *manager) patchConfig(w http.ResponseWriter, r *http.Request) {
+	var patch map[string]any
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 2<<20))
+	if err := decoder.Decode(&patch); err != nil || patch == nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": "invalid configuration patch"})
+		return
+	}
+	overridesPath := filepath.Join(m.cfg.RuntimeDir, "overrides.yaml")
+	overrides, err := readYAMLMap(overridesPath)
+	if errors.Is(err, os.ErrNotExist) {
+		overrides = map[string]any{}
+	} else if err != nil {
+		write(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	mergeMaps(overrides, patch)
+	active, err := readYAMLMap(filepath.Join(m.cfg.RuntimeDir, "active.yaml"))
+	if err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": "no active configuration"})
+		return
+	}
+	mergeMaps(active, overrides)
+	prepared, err := m.prepareDocument(active)
+	if err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err = m.activatePrepared(prepared); err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	encoded, err := yaml.Marshal(overrides)
+	if err != nil {
+		write(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err = atomicWrite(overridesPath, encoded, 0o640); err != nil {
+		write(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (m *manager) prepare(data []byte) ([]byte, error) {
@@ -159,6 +258,15 @@ func (m *manager) prepare(data []byte) ([]byte, error) {
 	if doc == nil {
 		doc = map[string]any{}
 	}
+	if overrides, err := readYAMLMap(filepath.Join(m.cfg.RuntimeDir, "overrides.yaml")); err == nil {
+		mergeMaps(doc, overrides)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read configuration overrides: %w", err)
+	}
+	return m.prepareDocument(doc)
+}
+
+func (m *manager) prepareDocument(doc map[string]any) ([]byte, error) {
 	if err := sanitizeProviderPaths(doc["proxy-providers"]); err != nil {
 		return nil, err
 	}
@@ -180,9 +288,12 @@ func (m *manager) prepare(data []byte) ([]byte, error) {
 	return yaml.Marshal(doc)
 }
 func (m *manager) validate(file string) error {
+	return m.validateWith(m.coreBinary(), file)
+}
+func (m *manager) validateWith(binary, file string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, m.cfg.MihomoBinary, "-t", "-d", m.cfg.RuntimeDir, "-f", file)
+	cmd := exec.CommandContext(ctx, binary, "-t", "-d", m.cfg.RuntimeDir, "-f", file)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mihomo validation failed: %s", strings.TrimSpace(string(output)))
@@ -199,7 +310,7 @@ func (m *manager) start() error {
 	if _, err := os.Stat(active); err != nil {
 		return fmt.Errorf("no active configuration")
 	}
-	cmd := exec.Command(m.cfg.MihomoBinary, "-d", m.cfg.RuntimeDir, "-f", active)
+	cmd := exec.Command(m.coreBinary(), "-d", m.cfg.RuntimeDir, "-f", active)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	setProcessGroup(cmd)
@@ -271,6 +382,45 @@ func copyFile(from, to string) error {
 		return err
 	}
 	return os.WriteFile(to, data, 0o640)
+}
+
+func readYAMLMap(file string) (map[string]any, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err = yaml.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	if result == nil {
+		result = map[string]any{}
+	}
+	return result, nil
+}
+
+func mergeMaps(target, patch map[string]any) {
+	for key, value := range patch {
+		if nestedPatch, ok := value.(map[string]any); ok {
+			if nestedTarget, ok := target[key].(map[string]any); ok {
+				mergeMaps(nestedTarget, nestedPatch)
+				continue
+			}
+		}
+		target[key] = value
+	}
+}
+
+func atomicWrite(file string, data []byte, mode os.FileMode) error {
+	temporary := file + ".tmp"
+	if err := os.WriteFile(temporary, data, mode); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporary, mode); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return os.Rename(temporary, file)
 }
 
 func sanitizeProviderPaths(value any) error {

@@ -3,8 +3,11 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestAuthenticationCSRFAndForcedPasswordChange(t *testing.T) {
@@ -69,5 +72,35 @@ func TestAuthenticationCSRFAndForcedPasswordChange(t *testing.T) {
 	handler.ServeHTTP(logoutResult, logout)
 	if logoutResult.Code != http.StatusNoContent {
 		t.Fatalf("valid logout returned %d: %s", logoutResult.Code, logoutResult.Body.String())
+	}
+}
+
+func TestProxyDynamicResolvesEachRequestIndependently(t *testing.T) {
+	paths := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	server := &Server{mihomo: upstream.Client(), mihomoBase: upstream.URL}
+	router := chi.NewRouter()
+	router.Put("/proxies/{name}", server.proxyDynamic(http.MethodPut, "/proxies/{name}"))
+
+	for _, name := range []string{"一分机场", "自动选择"} {
+		req := httptest.NewRequest(http.MethodPut, "/proxies/"+url.PathEscape(name), strings.NewReader(`{"name":"node"}`))
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("request for %q returned %d", name, res.Code)
+		}
+	}
+
+	for _, want := range []string{"/proxies/%E4%B8%80%E5%88%86%E6%9C%BA%E5%9C%BA", "/proxies/%E8%87%AA%E5%8A%A8%E9%80%89%E6%8B%A9"} {
+		if got := <-paths; got != want {
+			t.Fatalf("upstream path = %q, want %q", got, want)
+		}
 	}
 }

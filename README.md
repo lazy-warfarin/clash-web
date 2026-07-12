@@ -15,7 +15,7 @@ Browser ──HTTPS──> Nginx/Caddy ──HTTP──> clash-web serve (unpriv
                     └────────── mihomo process + TUN ─────────────┘
 ```
 
-Web 服务不以 root 运行，也不会将 mihomo Controller 暴露到 TCP 网络。只有 helper 能启动内核、验证并原子切换配置，以及管理 TUN/路由能力。
+Web 服务不以 root 运行，也不会将 mihomo Controller 暴露到 TCP 网络。只有 helper 能启动内核、验证并原子切换配置、管理 TUN/路由能力，以及执行受限的官方内核和 GeoData 更新。
 
 ## 本地开发
 
@@ -129,12 +129,15 @@ sudo clash-web reset-password
 
 配置和订阅保存在 `/var/lib/clash-web`，普通卸载不会删除这些数据。
 
+设置页中的局域网、IPv6、端口、DNS 和 TUN 设置会保存到 `/var/lib/clash-web/runtime/overrides.yaml`，以后更新或重新启用订阅时仍会覆盖到最终运行配置。高级设置里的“当前配置”用于直接查看和验证最终 YAML。
+
 ## 安全约束
 
 - 订阅下载仅接受 HTTP/HTTPS，默认阻止回环、私网、链路本地和保留地址。
 - 所有浏览器 API 与 WebSocket 都要求登录；写操作执行 Origin 检查。
-- helper IPC 不接受任意命令或任意路径，只提供状态、启停、重启和验证后激活配置。
-- 应用不提供在线内核升级。mihomo 只能随经过校验的新 deb 更新。
+- helper IPC 不接受任意命令、任意 URL 或任意文件路径，只提供预定义的状态、启停、配置、内核和 GeoData 操作。
+- 在线内核更新只查询 MetaCubeX/mihomo 的 GitHub 官方稳定版，只接受当前 Linux 架构的标准资产，并核对 GitHub 发布的 SHA-256；内置内核不会被覆盖，可随时切回。
+- GeoData 更新只接受 MetaCubeX/meta-rules-dat 官方发布中的预定义资产，并在原子替换前核对 SHA-256。
 
 ## 许可证
 
