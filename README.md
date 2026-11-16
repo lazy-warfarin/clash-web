@@ -19,7 +19,7 @@ Web 服务不以 root 运行，也不会将 mihomo Controller 暴露到 TCP 网�
 
 ## 本地开发
 
-需要 Go 1.24、Node.js 24 和 pnpm 10。
+需要 Go 1.27、Node.js 24 和 pnpm 10。
 
 ```bash
 cd ui
@@ -47,8 +47,8 @@ helper_socket: tcp://127.0.0.1:9088
 
 发布脚本会构建 amd64 和 arm64 两种包，并从固定 tag 构建 mihomo：
 
-- mihomo tag：`v1.19.27`
-- commit：`5184081ac327394d9e15fa5d5f9f4a61e723fd94`
+- mihomo tag：`v1.19.33`
+- commit：`3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8`
 
 脚本在 tag 与 commit 不一致时终止，产物的 SHA-256 会写入包内的 `BUILD-INFO`。
 

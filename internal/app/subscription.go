@@ -15,6 +15,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// fetchOptions carries per-profile subscription download settings. The zero
+// value matches the historical behaviour: default User-Agent, 25s timeout,
+// direct connection with SSRF guards.
+type fetchOptions struct {
+	UserAgent string        // empty = "Clash.Meta"
+	Timeout   time.Duration // zero = 25s
+	ProxyURL  *url.URL      // nil = direct connection
+}
+
 func validateYAML(content string) error {
 	if strings.TrimSpace(content) == "" {
 		return errors.New("profile content is empty")
@@ -32,13 +41,26 @@ func validateYAML(content string) error {
 	return nil
 }
 
-func fetchSubscription(ctx context.Context, rawURL string, allowPrivate bool) (string, error) {
+func fetchSubscription(ctx context.Context, rawURL string, allowPrivate bool, opt fetchOptions) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", errors.New("subscription URL must use http or https")
 	}
+	if opt.Timeout <= 0 {
+		opt.Timeout = 25 * time.Second
+	}
+	if opt.UserAgent == "" {
+		opt.UserAgent = "Clash.Meta"
+	}
 	dialer := &net.Dialer{Timeout: 8 * time.Second}
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		// When fetching through the local mihomo port the actual outbound
+		// connection is made by mihomo, so the destination resolved here is
+		// only the proxy's loopback address; the private-range guard must not
+		// apply to it.
+		if opt.ProxyURL != nil {
+			return dialer.DialContext(ctx, network, address)
+		}
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, err
@@ -56,7 +78,10 @@ func fetchSubscription(ctx context.Context, rawURL string, allowPrivate bool) (s
 		}
 		return dialer.DialContext(ctx, network, address)
 	}}
-	client := &http.Client{Transport: transport, Timeout: 25 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	if opt.ProxyURL != nil {
+		transport.Proxy = http.ProxyURL(opt.ProxyURL)
+	}
+	client := &http.Client{Transport: transport, Timeout: opt.Timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 3 {
 			return errors.New("too many redirects")
 		}
@@ -69,7 +94,7 @@ func fetchSubscription(ctx context.Context, rawURL string, allowPrivate bool) (s
 	// Subscription providers commonly use the User-Agent to choose the output
 	// format. Identify the compatible core so providers return a mihomo/Clash
 	// configuration instead of a generic or legacy client payload.
-	req.Header.Set("User-Agent", "Clash.Meta")
+	req.Header.Set("User-Agent", opt.UserAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

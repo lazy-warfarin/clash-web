@@ -10,16 +10,17 @@ import {
 } from '@mui/material'
 import {
   AddRounded, BoltRounded, BugReportRounded, ChevronRightRounded, CloudDownloadRounded,
-  DashboardRounded, DeleteOutlineRounded, DeviceHubRounded, DnsRounded, EditRounded,
-  FilterAltRounded, HubRounded, LanRounded, LockResetRounded, MenuRounded, MemoryRounded,
-  NetworkCheckRounded, PauseRounded, PlayArrowRounded, PowerSettingsNewRounded,
-  RefreshRounded, RestartAltRounded, RouteRounded, SearchRounded, SettingsRounded,
-  ShieldRounded, SpeedRounded, StopRounded, StorageRounded, SwapVertRounded,
-  TerminalRounded, TimelineRounded, TuneRounded, UploadFileRounded, WifiRounded,
+  DashboardRounded, DeleteOutlineRounded, DeviceHubRounded, DirectionsRounded, DnsRounded,
+  EditRounded, FilterAltRounded, HubRounded, LanRounded, LanguageRounded, LockResetRounded,
+  MenuRounded, MemoryRounded, MultipleStopRounded, NetworkCheckRounded, PauseRounded,
+  PlayArrowRounded, PowerSettingsNewRounded, RefreshRounded, RestartAltRounded, RouteRounded,
+  SearchRounded, SettingsRounded, ShieldRounded, SpeedRounded, StopRounded, StorageRounded,
+  SwapVertRounded, TerminalRounded, TimelineRounded, TuneRounded, UploadFileRounded,
+  WifiRounded,
 } from '@mui/icons-material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router'
-import { APIError, Me, Profile, Status, api, json, wsURL } from './api'
+import { APIError, Me, Profile, ProfileSettings, RefreshAllResponse, Status, api, json, wsURL } from './api'
 
 const drawerWidth = 224
 
@@ -74,8 +75,24 @@ function Shell({ me }: { me: Me }) {
   const qc = useQueryClient()
   const status = useQuery<Status>({ queryKey: ['status'], queryFn: () => api('/status'), refetchInterval: 5000 })
   const [traffic, setTraffic] = useState<TrafficPoint[]>([])
+  const [toast, setToast] = useState<{ message: string; severity: 'success' | 'error' | 'info' | 'warning' } | null>(null)
   useLiveStream('traffic', status.data?.coreOnline === true, data => {
     setTraffic(current => [...current.slice(-34), { up: Number(data.up || 0), down: Number(data.down || 0), upTotal: Number(data.upTotal || 0), downTotal: Number(data.downTotal || 0) }])
+  })
+  const refreshAll = useMutation({
+    mutationFn: () => api<RefreshAllResponse>('/profiles/refresh-all', { method: 'POST' }),
+    onSuccess: data => {
+      qc.invalidateQueries({ queryKey: ['profiles'] })
+      qc.invalidateQueries({ queryKey: ['status'] })
+      qc.invalidateQueries({ queryKey: ['proxies'] })
+      const ok = data.results.filter(r => r.ok)
+      const failed = data.results.filter(r => !r.ok)
+      if (data.results.length === 0) setToast({ message: '没有可刷新的远程订阅', severity: 'info' })
+      else if (failed.length === 0) setToast({ message: `已更新 ${ok.length} 个订阅${data.reloaded ? '，配置已重新加载' : ''}`, severity: 'success' })
+      else if (ok.length === 0) setToast({ message: `${failed.length} 个订阅全部刷新失败：${failed[0].name}（${failed[0].error}）`, severity: 'error' })
+      else setToast({ message: `${ok.length} 个成功，${failed.length} 个失败：${failed.map(f => f.name).join('、')}`, severity: 'warning' })
+    },
+    onError: error => setToast({ message: `刷新订阅失败：${(error as Error).message}`, severity: 'error' }),
   })
   const title = nav.find(([, href]) => location.pathname === href)?.[0] || 'Clash Web'
   const logout = async () => { await api('/auth/logout', { method: 'POST' }); await qc.invalidateQueries({ queryKey: ['me'] }) }
@@ -92,7 +109,7 @@ function Shell({ me }: { me: Me }) {
       <Toolbar><IconButton onClick={() => setOpen(true)} sx={{ display: mobile ? 'inline-flex' : 'none', mr: 1 }}><MenuRounded /></IconButton>
         <Box sx={{ flex: 1 }}><Typography variant="overline" color="text.secondary">CONTROL / {location.pathname.slice(1).toUpperCase() || 'OVERVIEW'}</Typography><Typography variant="h6" lineHeight={1}>{title}</Typography></Box>
         <Chip size="small" className={status.data?.coreOnline ? 'status-chip online' : 'status-chip'} icon={<BoltRounded />} label={status.data?.coreOnline ? '内核运行中' : '内核离线'} />
-        <Tooltip title="刷新"><IconButton onClick={() => status.refetch()}><RefreshRounded /></IconButton></Tooltip>
+        <Tooltip title={refreshAll.isPending ? '正在刷新全部订阅…' : '刷新全部订阅'}><span><IconButton disabled={refreshAll.isPending} onClick={() => refreshAll.mutate()}><RefreshRounded className={refreshAll.isPending ? 'spinning' : ''} /></IconButton></span></Tooltip>
         <Tooltip title={`${me.username} · 退出`}><IconButton onClick={logout}><Avatar sx={{ width: 30, height: 30, bgcolor: 'secondary.main', fontSize: 13 }}>AD</Avatar></IconButton></Tooltip>
       </Toolbar>
     </AppBar>
@@ -110,6 +127,9 @@ function Shell({ me }: { me: Me }) {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Box>
+    <Snackbar open={!!toast} autoHideDuration={4500} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
+      <Alert onClose={() => setToast(null)} severity={toast?.severity || 'info'} variant="filled">{toast?.message}</Alert>
+    </Snackbar>
   </Box>
 }
 
@@ -118,9 +138,11 @@ type TrafficPoint = { up: number; down: number; upTotal: number; downTotal: numb
 function HomePage({ status, traffic }: { status?: Status; traffic: TrafficPoint[] }) {
   const qc = useQueryClient()
   const action = useMutation({ mutationFn: (name: string) => api(`/core/${name}`, { method: 'POST' }), onSuccess: () => qc.invalidateQueries({ queryKey: ['status'] }) })
+  const [notice, setNotice] = useState('')
   const last = traffic.at(-1) || { up: 0, down: 0, upTotal: 0, downTotal: 0 }
   const config = status?.config || {}
   return <Stack spacing={2.2}>
+    <ModeCard status={status} onNotice={setNotice} />
     <Box className="hero-grid">
       <Card className="hero-status"><CardContent>
         <Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box><Typography variant="overline" color="text.secondary">CORE ENGINE</Typography><Typography variant="h4" sx={{ mt: .5 }}>{status?.coreOnline ? '路径已接管' : '等待配置'}</Typography></Box><Box className={`pulse ${status?.coreOnline ? 'live' : ''}`} /></Stack>
@@ -136,46 +158,118 @@ function HomePage({ status, traffic }: { status?: Status; traffic: TrafficPoint[
       <StatCard icon={<TimelineRounded />} label="累计下载" value={bytes(last.downTotal)} foot={`上传 ${bytes(last.upTotal)}`} />
     </Box>
     {!status?.helperOnline && <EmptyGuide title="管理助手未连接" detail="检查 clash-web-helper.service 是否正在运行，以及 Unix Socket 权限。" />}
+    <Snackbar open={!!notice} autoHideDuration={3500} onClose={() => setNotice('')} message={notice} />
   </Stack>
+}
+
+const MODE_META: Record<string, { label: string; description: string; icon: React.ReactNode }> = {
+  rule: { label: '规则', description: '流量按规则分流', icon: <MultipleStopRounded fontSize="small" /> },
+  global: { label: '全局', description: '所有流量经代理出口', icon: <LanguageRounded fontSize="small" /> },
+  direct: { label: '直连', description: '不代理，直接连接', icon: <DirectionsRounded fontSize="small" /> },
+}
+
+// ModeCard mirrors clash-verge-rev's ClashModeCard: a prominent three-button
+// switch that hot-swaps the mihomo runtime mode without restarting the core.
+function ModeCard({ status, onNotice }: { status?: Status; onNotice: (message: string) => void }) {
+  const qc = useQueryClient()
+  const [optimistic, setOptimistic] = useState<string | null>(null)
+  const currentMode = (optimistic ?? String(status?.config?.mode || 'rule')).toLowerCase()
+  const switchMode = useMutation({
+    mutationFn: (mode: string) => api('/mode', json('PATCH', { mode })),
+    onMutate: mode => setOptimistic(mode),
+    onSuccess: () => { setOptimistic(null); qc.invalidateQueries({ queryKey: ['status'] }); qc.invalidateQueries({ queryKey: ['proxies'] }) },
+    onError: error => { setOptimistic(null); onNotice(`切换代理模式失败：${(error as Error).message}`) },
+  })
+  return <Card><CardContent className="mode-card">
+    <div className="mode-buttons">
+      {Object.entries(MODE_META).map(([mode, meta]) => (
+        <Box key={mode} component="button" className={mode === currentMode ? 'mode-button on' : 'mode-button'} onClick={() => mode !== currentMode && switchMode.mutate(mode)} disabled={switchMode.isPending || !status?.coreOnline}>
+          {meta.icon}
+          <span>{meta.label}</span>
+        </Box>
+      ))}
+    </div>
+    <Typography variant="caption" className="mode-description">{MODE_META[currentMode]?.description || '与内核通信异常，无法确认当前模式'}</Typography>
+  </CardContent></Card>
 }
 
 function ProxiesPage({ online }: { online?: boolean }) {
   const [query, setQuery] = useState('')
+  const [sortByDelay, setSortByDelay] = useState(false)
+  const [testingGroup, setTestingGroup] = useState<string | null>(null)
   const qc = useQueryClient()
   const proxies = useQuery<any>({ queryKey: ['proxies'], queryFn: () => api('/proxies'), enabled: !!online, refetchInterval: 10000 })
   const select = useMutation({ mutationFn: ({ group, name }: { group: string; name: string }) => api(`/proxies/${encodeURIComponent(group)}`, json('PUT', { name })), onSuccess: () => qc.invalidateQueries({ queryKey: ['proxies'] }) })
+  const testGroup = async (group: any) => {
+    setTestingGroup(group.name)
+    try {
+      await api(`/group/${encodeURIComponent(group.name)}/delay?url=${encodeURIComponent('http://cp.cloudflare.com/generate_204')}&timeout=5000`)
+      await qc.invalidateQueries({ queryKey: ['proxies'] })
+    } finally {
+      setTestingGroup(null)
+    }
+  }
   if (!online) return <OfflineState />
   if (proxies.isLoading) return <CenteredProgress />
   const records = proxies.data?.proxies || {}
   const groups = Object.values(records).filter((p: any) => Array.isArray(p.all)) as any[]
+  const nodeDelay = (name: string): number => {
+    const history = records[name]?.history
+    return history?.length ? history[history.length - 1].delay : 0
+  }
   return <Stack spacing={2}><PageTools title={`${groups.length} 个代理组`} query={query} setQuery={setQuery} action={<Button startIcon={<SpeedRounded />} onClick={() => qc.invalidateQueries({ queryKey: ['proxies'] })}>刷新状态</Button>} />
     {select.error && <Alert severity="error">{(select.error as Error).message}</Alert>}
-    <Box className="proxy-grid">{groups.filter(g => g.name.toLowerCase().includes(query.toLowerCase()) || g.all.some((n: string) => n.toLowerCase().includes(query.toLowerCase()))).map(group => <Card key={group.name} className="proxy-group"><CardContent>
-      <Stack direction="row" justifyContent="space-between"><Box><Typography variant="h6">{group.name}</Typography><Typography variant="caption" color="text.secondary">{group.type} · {group.all.length} nodes</Typography></Box><Chip size="small" label={group.now || '未选择'} color="primary" variant="outlined" /></Stack>
+    <Box className="proxy-grid">{groups.filter(g => g.name.toLowerCase().includes(query.toLowerCase()) || g.all.some((n: string) => n.toLowerCase().includes(query.toLowerCase()))).map(group => {
+      const testing = testingGroup === group.name
+      const names = sortByDelay ? [...group.all].sort((a: string, b: string) => (nodeDelay(a) || Infinity) - (nodeDelay(b) || Infinity)) : group.all
+      return <Card key={group.name} className="proxy-group"><CardContent>
+      <Stack direction="row" justifyContent="space-between"><Box><Typography variant="h6">{group.name}</Typography><Typography variant="caption" color="text.secondary">{group.type} · {group.all.length} nodes</Typography></Box><Stack direction="row" spacing={.5} alignItems="center"><Tooltip title={sortByDelay ? '恢复默认排序' : '按延迟排序'}><IconButton size="small" color={sortByDelay ? 'primary' : 'default'} onClick={() => setSortByDelay(v => !v)}><SwapVertRounded fontSize="small" /></IconButton></Tooltip><Tooltip title="组内测速"><IconButton size="small" onClick={() => testGroup(group)} disabled={testing}><SpeedRounded fontSize="small" className={testing ? 'spinning' : ''} /></IconButton></Tooltip><Chip size="small" label={group.now || '未选择'} color="primary" variant="outlined" /></Stack></Stack>
       {String(group.type).toLowerCase() !== 'selector' && <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>该组由 mihomo 自动选择，节点状态仅供查看。</Alert>}
-      <Divider sx={{ my: 2 }} /><Box className="node-list">{group.all.map((name: string) => { const node = records[name] || {}; const delay = node.history?.at(-1)?.delay; const selectable = String(group.type).toLowerCase() === 'selector'; return <Button key={name} disabled={!selectable || select.isPending} className={group.now === name ? 'node active' : 'node'} onClick={() => select.mutate({ group: group.name, name })}><span>{name}</span><small>{delay ? `${delay} ms` : node.type || '—'}</small></Button> })}</Box>
-    </CardContent></Card>)}</Box>
+      <Divider sx={{ my: 2 }} /><Box className="node-list">{names.map((name: string) => { const node = records[name] || {}; const delay = nodeDelay(name); const selectable = String(group.type).toLowerCase() === 'selector'; return <Button key={name} disabled={!selectable || select.isPending} className={group.now === name ? 'node active' : 'node'} onClick={() => select.mutate({ group: group.name, name })}><span>{name}</span><small className={delayClass(testing, delay)}>{formatDelay(testing, delay) || node.type || '—'}</small></Button> })}</Box>
+    </CardContent></Card>})}</Box>
     {!groups.length && <EmptyGuide title="没有代理组" detail="当前配置没有可选择的策略组。" />}
   </Stack>
 }
 
+// delayClass / formatDelay mirror clash-verge-rev's delay grading:
+// untested and in-flight values stay neutral; timeouts are errors; measured
+// delays split into fast (<250), medium (<400) and slow buckets.
+function delayClass(testing: boolean, delay: number) {
+  if (testing) return ''
+  if (delay === 0) return 'delay-timeout'
+  if (delay < 0) return 'delay-timeout'
+  if (delay < 250) return 'delay-fast'
+  if (delay < 400) return 'delay-medium'
+  return 'delay-slow'
+}
+function formatDelay(testing: boolean, delay: number) {
+  if (testing) return 'testing'
+  if (delay === 0) return ''
+  if (delay < 0) return 'Timeout'
+  return `${delay} ms`
+}
+
 function ProfilesPage() {
-  const qc = useQueryClient(); const [open, setOpen] = useState(false); const [editing, setEditing] = useState<Profile | null>(null); const [message, setMessage] = useState('')
+  const qc = useQueryClient(); const [open, setOpen] = useState(false); const [editing, setEditing] = useState<Profile | null>(null); const [message, setMessage] = useState(''); const [error, setError] = useState('')
   const profiles = useQuery<{ profiles: Profile[] }>({ queryKey: ['profiles'], queryFn: () => api('/profiles/') })
-  const activate = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/activate`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); qc.invalidateQueries({ queryKey: ['status'] }); setMessage('配置已验证并启用') } })
+  const activate = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/activate`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); qc.invalidateQueries({ queryKey: ['status'] }); setMessage('配置已验证并启用') }, onError: e => setError((e as Error).message) })
   const remove = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}`, { method: 'DELETE' }), onSuccess: () => qc.invalidateQueries({ queryKey: ['profiles'] }) })
-  const refresh = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/refresh`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); setMessage('订阅已更新') } })
+  const refresh = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/refresh`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); qc.invalidateQueries({ queryKey: ['status'] }); setMessage('订阅已更新') }, onError: e => { qc.invalidateQueries({ queryKey: ['profiles'] }); setError(`订阅更新失败：${(e as Error).message}`) } })
   const loadEditor = async (p: Profile) => setEditing(await api(`/profiles/${p.id}`))
   return <><Stack spacing={2}><PageTools title="配置与订阅" action={<Button variant="contained" startIcon={<AddRounded />} onClick={() => setOpen(true)}>新建订阅</Button>} />
-    <Box className="profile-grid">{(profiles.data?.profiles || []).map(p => <Card key={p.id} className={p.active ? 'profile-card active' : 'profile-card'}><CardContent>
-      <Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box className="profile-icon"><DnsRounded /></Box><Chip size="small" label={p.active ? 'ACTIVE' : p.source.toUpperCase()} color={p.active ? 'primary' : 'default'} /></Stack>
+    <Box className="profile-grid">{(profiles.data?.profiles || []).map(p => {
+      const nextUpdate = p.settings?.updateInterval ? new Date(new Date(p.updatedAt).getTime() + p.settings.updateInterval * 60000) : null
+      return <Card key={p.id} className={p.active ? 'profile-card active' : 'profile-card'}><CardContent>
+      <Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box className="profile-icon"><DnsRounded /></Box><Stack direction="row" spacing={.5}>{p.settings?.updateInterval ? <Tooltip title={`下次自动更新：${displayTime(nextUpdate!.toISOString())}`}><Chip size="small" label={`每 ${p.settings.updateInterval} 分钟`} variant="outlined" /></Tooltip> : null}{p.settings?.withProxy ? <Tooltip title="通过本机代理下载"><Chip size="small" label="代理" variant="outlined" /></Tooltip> : null}<Chip size="small" label={p.active ? 'ACTIVE' : p.source.toUpperCase()} color={p.active ? 'primary' : 'default'} /></Stack></Stack>
       <Typography variant="h6" sx={{ mt: 2 }}>{p.name}</Typography><Typography variant="body2" color="text.secondary" noWrap>{p.url || '本地 YAML 配置'}</Typography><Typography variant="caption" color="text.secondary">更新于 {displayTime(p.updatedAt)}</Typography>
-      <Divider sx={{ my: 2 }} /><Stack direction="row" spacing={.5}><Tooltip title="启用"><IconButton color={p.active ? 'primary' : 'default'} onClick={() => activate.mutate(p.id)}><PlayArrowRounded /></IconButton></Tooltip>{p.url && <Tooltip title="更新"><IconButton onClick={() => refresh.mutate(p.id)}><CloudDownloadRounded /></IconButton></Tooltip>}<Tooltip title="编辑"><IconButton onClick={() => loadEditor(p)}><EditRounded /></IconButton></Tooltip><Box flex={1}/><Tooltip title="删除"><IconButton color="error" onClick={() => remove.mutate(p.id)}><DeleteOutlineRounded /></IconButton></Tooltip></Stack>
-    </CardContent></Card>)}</Box>
+      {p.settings?.lastUpdateError && <Alert severity="error" sx={{ mt: 1 }}>上次更新失败：{p.settings.lastUpdateError}</Alert>}
+      <Divider sx={{ my: 2 }} /><Stack direction="row" spacing={.5}><Tooltip title="启用"><IconButton color={p.active ? 'primary' : 'default'} onClick={() => activate.mutate(p.id)}><PlayArrowRounded /></IconButton></Tooltip>{p.url && <Tooltip title="更新"><IconButton onClick={() => refresh.mutate(p.id)} disabled={refresh.isPending}><CloudDownloadRounded /></IconButton></Tooltip>}<Tooltip title="编辑"><IconButton onClick={() => loadEditor(p)}><EditRounded /></IconButton></Tooltip><Box flex={1}/><Tooltip title="删除"><IconButton color="error" onClick={() => remove.mutate(p.id)}><DeleteOutlineRounded /></IconButton></Tooltip></Stack>
+    </CardContent></Card>})}</Box>
     {!profiles.data?.profiles.length && <EmptyGuide title="还没有订阅" detail="从 URL 导入，或粘贴一份 mihomo YAML 配置开始使用。" action={<Button variant="contained" onClick={() => setOpen(true)}>添加第一个配置</Button>} />}</Stack>
     <ProfileDialog open={open} onClose={() => setOpen(false)} onSaved={() => { setOpen(false); qc.invalidateQueries({ queryKey: ['profiles'] }) }} />
     <EditorDialog profile={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); qc.invalidateQueries({ queryKey: ['profiles'] }) }} />
     <Snackbar open={!!message} autoHideDuration={2600} onClose={() => setMessage('')} message={message} />
+    <Snackbar open={!!error} autoHideDuration={4500} onClose={() => setError('')} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}><Alert onClose={() => setError('')} severity="error" variant="filled">{error}</Alert></Snackbar>
   </>
 }
 
@@ -387,18 +481,53 @@ function CurrentConfigDialog({ content, setContent, onSave }: { content: string 
   </Dialog>
 }
 
+const MIN_UPDATE_INTERVAL = 1440
+
 function ProfileDialog({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: () => void }) {
-  const [value, setValue] = useState({ name: '', url: '', content: '', source: 'remote' }); const [error, setError] = useState('')
-  const save = async () => { try { await api('/profiles/', json('POST', value)); setValue({ name: '', url: '', content: '', source: 'remote' }); onSaved() } catch (e) { setError((e as Error).message) } }
+  const [value, setValue] = useState({ name: '', url: '', content: '', source: 'remote' })
+  const [settings, setSettings] = useState<ProfileSettings>({ updateInterval: 0, userAgent: '', timeoutSeconds: 0, withProxy: false })
+  const [error, setError] = useState('')
+  const interval = Number(settings.updateInterval) || 0
+  const tooFrequent = interval > 0 && interval < MIN_UPDATE_INTERVAL
+  const save = async () => {
+    try {
+      await api('/profiles/', json('POST', { ...value, settings }))
+      setValue({ name: '', url: '', content: '', source: 'remote' })
+      setSettings({ updateInterval: 0, userAgent: '', timeoutSeconds: 0, withProxy: false })
+      onSaved()
+    } catch (e) { setError((e as Error).message) }
+  }
   const chooseFile = async (file?: File) => { if (!file) return; if (file.size > 20 * 1024 * 1024) { setError('配置文件不能超过 20 MiB'); return }; const content = await file.text(); setValue(v => ({ ...v, name: v.name || file.name.replace(/\.ya?ml$/i, ''), content, url: '', source: 'local' })) }
-  return <Dialog open={open} onClose={onClose} fullWidth maxWidth="md"><DialogTitle>添加配置</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}><TextField label="名称" value={value.name} onChange={e => setValue(v => ({ ...v, name: e.target.value }))}/><TextField label="订阅 URL（与 YAML 二选一）" value={value.url} onChange={e => setValue(v => ({ ...v, url: e.target.value, source: 'remote' }))}/><Divider>或导入本地 YAML</Divider><Button component="label" variant="outlined" startIcon={<UploadFileRounded />}>选择 YAML 文件<input hidden type="file" accept=".yaml,.yml,text/yaml" onChange={e => chooseFile(e.target.files?.[0])}/></Button><TextField multiline minRows={10} label="mihomo YAML" value={value.content} onChange={e => setValue(v => ({ ...v, content: e.target.value, url: '', source: 'local' }))} InputProps={{ sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } }}/>{error && <Alert severity="error">{error}</Alert>}</Stack></DialogContent><DialogActions><Button onClick={onClose}>取消</Button><Button variant="contained" onClick={save} disabled={!value.name || (!value.url && !value.content)}>保存配置</Button></DialogActions></Dialog>
+  return <Dialog open={open} onClose={onClose} fullWidth maxWidth="md"><DialogTitle>添加配置</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
+    <TextField label="名称" value={value.name} onChange={e => setValue(v => ({ ...v, name: e.target.value }))}/>
+    <TextField label="订阅 URL（与 YAML 二选一）" value={value.url} onChange={e => setValue(v => ({ ...v, url: e.target.value, source: 'remote' }))}/>
+    <Divider>或导入本地 YAML</Divider>
+    <Button component="label" variant="outlined" startIcon={<UploadFileRounded />}>选择 YAML 文件<input hidden type="file" accept=".yaml,.yml,text/yaml" onChange={e => chooseFile(e.target.files?.[0])}/></Button>
+    <TextField multiline minRows={10} label="mihomo YAML" value={value.content} onChange={e => setValue(v => ({ ...v, content: e.target.value, url: '', source: 'local' }))} InputProps={{ sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } }}/>
+    {value.url !== '' && <><Divider>订阅设置</Divider>
+      <TextField label="自动更新间隔（分钟）" type="number" value={settings.updateInterval} inputProps={{ min: 0 }}
+        helperText={tooFrequent ? `间隔低于 ${MIN_UPDATE_INTERVAL} 分钟（24 小时）会被调整为 ${MIN_UPDATE_INTERVAL}` : '留空或 0 表示不自动更新'}
+        FormHelperTextProps={{ sx: tooFrequent ? { color: 'warning.main' } : undefined }}
+        onChange={e => setSettings(s => ({ ...s, updateInterval: Number(e.target.value) || 0 }))}/>
+      <TextField label="User-Agent" value={settings.userAgent || ''} placeholder="默认 Clash.Meta" onChange={e => setSettings(s => ({ ...s, userAgent: e.target.value }))}/>
+      <TextField label="下载超时（秒）" type="number" value={settings.timeoutSeconds} inputProps={{ min: 0, max: 120 }} helperText="0 表示默认 25 秒，最大 120" onChange={e => setSettings(s => ({ ...s, timeoutSeconds: Number(e.target.value) || 0 }))}/>
+      <SettingSwitch title="通过本机代理下载" detail="拉取订阅时走 mihomo 混合端口，订阅服务器需要代理可达时开启" checked={!!settings.withProxy} onChange={withProxy => setSettings(s => ({ ...s, withProxy }))}/>
+    </>}
+    {error && <Alert severity="error">{error}</Alert>}
+  </Stack></DialogContent><DialogActions><Button onClick={onClose}>取消</Button><Button variant="contained" onClick={save} disabled={!value.name || (!value.url && !value.content)}>保存配置</Button></DialogActions></Dialog>
 }
 
 function EditorDialog({ profile, onClose, onSaved }: { profile: Profile | null; onClose: () => void; onSaved: () => void }) {
   const [content, setContent] = useState(''); const [error, setError] = useState('')
   useEffect(() => setContent(profile?.content || ''), [profile])
   const save = async () => { if (!profile) return; try { await api(`/profiles/${profile.id}`, json('PUT', { name: profile.name, url: profile.url || '', content })); onSaved() } catch (e) { setError((e as Error).message) } }
-  return <Dialog open={!!profile} onClose={onClose} fullScreen><DialogTitle><Stack direction="row" alignItems="center" spacing={1}><EditRounded/><span>{profile?.name}</span><Chip size="small" label="YAML"/></Stack></DialogTitle><DialogContent sx={{ p: 0 }}><Editor height="calc(100vh - 132px)" defaultLanguage="yaml" theme="vs-dark" value={content} onChange={v => setContent(v || '')} options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, wordWrap: 'on', padding: { top: 18 } }}/>{error && <Alert severity="error" sx={{ position: 'absolute', bottom: 70, left: 20 }}>{error}</Alert>}</DialogContent><DialogActions><Button onClick={onClose}>取消</Button><Button variant="contained" onClick={save}>验证并保存</Button></DialogActions></Dialog>
+  const s = profile?.settings
+  const summary = !s || (!s.updateInterval && !s.withProxy && !s.userAgent) ? '未配置订阅设置' : [
+    s.updateInterval > 0 ? `每 ${s.updateInterval} 分钟自动更新` : '',
+    s.withProxy ? '走本机代理下载' : '',
+    s.userAgent ? `UA：${s.userAgent}` : '',
+  ].filter(Boolean).join(' · ')
+  return <Dialog open={!!profile} onClose={onClose} fullScreen><DialogTitle><Stack direction="row" alignItems="center" spacing={1}><EditRounded/><span>{profile?.name}</span><Chip size="small" label="YAML"/></Stack></DialogTitle><DialogContent sx={{ p: 0 }}><Editor height="calc(100vh - 132px)" defaultLanguage="yaml" theme="vs-dark" value={content} onChange={v => setContent(v || '')} options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, wordWrap: 'on', padding: { top: 18 } }}/>{error && <Alert severity="error" sx={{ position: 'absolute', bottom: 70, left: 20 }}>{error}</Alert>}</DialogContent><DialogActions><Typography variant="caption" color="text.secondary" sx={{ mr: 'auto', ml: 2 }}>{summary}（编辑 YAML 不会修改这些设置）</Typography><Button onClick={onClose}>取消</Button><Button variant="contained" onClick={save}>验证并保存</Button></DialogActions></Dialog>
 }
 
 function PageTools({ title, query, setQuery, action }: { title: string; query?: string; setQuery?: (s: string) => void; action?: React.ReactNode }) { return <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5} alignItems={{ sm: 'center' }}><Typography variant="h5" flex={1}>{title}</Typography>{setQuery && <TextField size="small" placeholder="筛选…" value={query} onChange={e => setQuery(e.target.value)} InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }} />}{action}</Stack> }

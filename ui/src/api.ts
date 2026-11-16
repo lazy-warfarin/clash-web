@@ -34,6 +34,13 @@ export type Status = {
   helper?: { running?: boolean; pid?: number; startedAt?: string; lastExit?: string; selectedCore?: string }
   config?: Record<string, any>
 }
+export type ProfileSettings = {
+  updateInterval: number
+  userAgent?: string
+  timeoutSeconds?: number
+  withProxy?: boolean
+  lastUpdateError?: string
+}
 export type Profile = {
   id: number
   name: string
@@ -42,6 +49,17 @@ export type Profile = {
   active: boolean
   updatedAt: string
   content?: string
+  settings?: ProfileSettings
+}
+export type RefreshResult = {
+  id: number
+  name: string
+  ok: boolean
+  error?: string
+}
+export type RefreshAllResponse = {
+  results: RefreshResult[]
+  reloaded: boolean
 }
 
 export const json = (method: string, body?: unknown): RequestInit => ({

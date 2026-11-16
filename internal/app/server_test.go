@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -102,5 +103,107 @@ func TestProxyDynamicResolvesEachRequestIndependently(t *testing.T) {
 		if got := <-paths; got != want {
 			t.Fatalf("upstream path = %q, want %q", got, want)
 		}
+	}
+}
+
+func TestPatchModeWhitelist(t *testing.T) {
+	var received []byte
+	var receivedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.Method + " " + r.URL.Path
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		received = buf
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	server := &Server{mihomo: upstream.Client(), mihomoBase: upstream.URL}
+	router := chi.NewRouter()
+	router.Patch("/mode", server.patchMode)
+
+	req := httptest.NewRequest(http.MethodPatch, "/mode", strings.NewReader(`{"mode":"global"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("valid mode returned %d: %s", res.Code, res.Body.String())
+	}
+	if receivedPath != "PATCH /configs" {
+		t.Fatalf("unexpected upstream call: %s", receivedPath)
+	}
+	if string(received) != `{"mode":"global"}` {
+		t.Fatalf("unexpected forwarded body: %s", received)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/mode", strings.NewReader(`{"mode":"chaos"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res = httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("invalid mode returned %d, want 400", res.Code)
+	}
+}
+
+func TestRefreshAllProfiles(t *testing.T) {
+	subscription := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("proxies: []\n"))
+	}))
+	defer subscription.Close()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.RuntimeDir = t.TempDir()
+	cfg.MihomoController = "http://127.0.0.1:1"
+	cfg.HelperSocket = "tcp://127.0.0.1:2"
+	// The test subscription server lives on the httptest loopback address.
+	cfg.AllowPrivateSubscriptionSources = true
+	server, err := New(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	if _, err = server.store.CreateProfile(Profile{Name: "good", Source: "remote", URL: subscription.URL, Content: "proxies: []", Settings: &ProfileSettings{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = server.store.CreateProfile(Profile{Name: "bad", Source: "remote", URL: "http://127.0.0.1:1/none", Content: "proxies: []"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = server.store.CreateProfile(Profile{Name: "local", Source: "local", Content: "proxies: []"}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, reloaded, err := server.refreshAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 remote profiles to be attempted, got %d", len(results))
+	}
+	byName := map[string]refreshResult{}
+	for _, result := range results {
+		byName[result.Name] = result
+	}
+	if !byName["good"].OK {
+		t.Fatalf("good profile failed: %+v", byName["good"])
+	}
+	if byName["bad"].OK {
+		t.Fatal("unreachable profile reported success")
+	}
+	if byName["bad"].Error == "" {
+		t.Fatal("failure detail missing")
+	}
+	if reloaded {
+		t.Fatal("no active profile, reloaded must be false")
+	}
+	// The failed profile must record its error for the UI.
+	failed, err := server.store.Profile(byName["bad"].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Settings.LastUpdateError == "" {
+		t.Fatal("last_update_error not recorded")
 	}
 }

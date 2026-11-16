@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${VERSION:-0.1.0}"
 VERSION="${VERSION#v}"
-MIHOMO_VERSION="v1.19.27"
-MIHOMO_COMMIT="5184081ac327394d9e15fa5d5f9f4a61e723fd94"
+MIHOMO_VERSION="v1.19.33"
+MIHOMO_COMMIT="3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}"
 export SOURCE_DATE_EPOCH
 

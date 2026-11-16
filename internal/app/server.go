@@ -32,6 +32,11 @@ import (
 const (
 	sessionCookie = "clash_web_session"
 	csrfCookie    = "clash_web_csrf"
+	// minAutoUpdateMinutes is the floor for scheduled subscription updates,
+	// mirroring clash-verge-rev's MIN_UPDATE_INTERVAL (once per day).
+	minAutoUpdateMinutes = 1440
+	// maxFetchTimeoutSeconds caps the per-profile subscription download timeout.
+	maxFetchTimeoutSeconds = 120
 )
 
 type Server struct {
@@ -44,6 +49,9 @@ type Server struct {
 	helperBase    string
 	loginMu       sync.Mutex
 	loginAttempts map[string][]time.Time
+	// refreshMu serializes subscription fetches so the scheduler, manual
+	// single refreshes and refresh-all never race on the same profile.
+	refreshMu sync.Mutex
 }
 
 type contextKey string
@@ -90,6 +98,7 @@ func New(cfg Config, version string) (*Server, error) {
 func (s *Server) Close() { _ = s.store.Close() }
 
 func (s *Server) Run(ctx context.Context) error {
+	go s.subscriptionLoop(ctx)
 	httpServer := &http.Server{Addr: s.cfg.Listen, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
@@ -125,12 +134,14 @@ func (s *Server) routes() http.Handler {
 			r.Route("/profiles", func(r chi.Router) {
 				r.Get("/", s.listProfiles)
 				r.Post("/", s.createProfile)
+				r.Post("/refresh-all", s.refreshAllProfiles)
 				r.Get("/{id}", s.getProfile)
 				r.Put("/{id}", s.updateProfile)
 				r.Delete("/{id}", s.deleteProfile)
 				r.Post("/{id}/activate", s.activateProfile)
 				r.Post("/{id}/refresh", s.refreshProfile)
 			})
+			r.Patch("/mode", s.patchMode)
 			r.Get("/config", s.proxyMihomo("GET", "/configs"))
 			r.Patch("/config", s.proxyHelper("PATCH", "/v1/config/overrides"))
 			r.Get("/current-config", s.proxyHelper("GET", "/v1/config/current"))
@@ -140,6 +151,7 @@ func (s *Server) routes() http.Handler {
 			r.Post("/cores/select", s.proxyHelper("POST", "/v1/cores/select"))
 			r.Post("/geodata/update", s.proxyHelper("POST", "/v1/geodata/update"))
 			r.Get("/proxies", s.proxyMihomo("GET", "/proxies"))
+			r.Get("/group/{name}/delay", s.proxyDynamic("GET", "/group/{name}/delay"))
 			r.Get("/proxies/{name}/delay", s.proxyDynamic("GET", "/proxies/{name}/delay"))
 			r.Put("/proxies/{name}", s.proxyDynamic("PUT", "/proxies/{name}"))
 			r.Get("/connections", s.proxyMihomo("GET", "/connections"))
@@ -367,8 +379,11 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "name is required")
 		return
 	}
+	if p.Settings != nil {
+		p.Settings = normalizeSettings(p.Settings)
+	}
 	if p.URL != "" && p.Content == "" {
-		content, err := fetchSubscription(r.Context(), p.URL, s.cfg.AllowPrivateSubscriptionSources)
+		content, err := fetchSubscription(r.Context(), p.URL, s.cfg.AllowPrivateSubscriptionSources, s.fetchOptionsFor(p.Settings))
 		if err != nil {
 			writeError(w, 400, err.Error())
 			return
@@ -406,6 +421,11 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	p.Name = in.Name
 	p.URL = in.URL
 	p.Content = in.Content
+	// A nil settings payload keeps the stored subscription options: the YAML
+	// editor saves without settings and must not silently wipe them.
+	if in.Settings != nil {
+		p.Settings = normalizeSettings(in.Settings)
+	}
 	if err = validateYAML(p.Content); err != nil {
 		writeError(w, 400, err.Error())
 		return
@@ -437,16 +457,238 @@ func (s *Server) refreshProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "profile has no remote URL")
 		return
 	}
-	p.Content, err = fetchSubscription(r.Context(), p.URL, s.cfg.AllowPrivateSubscriptionSources)
+	s.refreshMu.Lock()
+	updated, err := s.fetchProfileUpdate(r.Context(), p)
+	s.refreshMu.Unlock()
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if err = s.store.UpdateProfile(p); err != nil {
+	writeJSON(w, 200, updated)
+}
+
+// refreshResult reports the outcome of a single profile refresh for
+// refresh-all aggregation in the UI.
+type refreshResult struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+func (s *Server) refreshAllProfiles(w http.ResponseWriter, r *http.Request) {
+	results, reloaded, err := s.refreshAll(r.Context())
+	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, p)
+	writeJSON(w, 200, map[string]any{"results": results, "reloaded": reloaded})
+}
+
+// refreshAll downloads every remote profile serially and reports per-profile
+// outcomes plus whether the active profile was reloaded.
+func (s *Server) refreshAll(ctx context.Context) ([]refreshResult, bool, error) {
+	profiles, err := s.store.Profiles()
+	if err != nil {
+		return nil, false, err
+	}
+	remote := make([]Profile, 0, len(profiles))
+	for _, p := range profiles {
+		if p.URL != "" {
+			remote = append(remote, p)
+		}
+	}
+	if len(remote) == 0 {
+		return []refreshResult{}, false, nil
+	}
+	results := make([]refreshResult, 0, len(remote))
+	reloaded := false
+	s.refreshMu.Lock()
+	for _, p := range remote {
+		if _, err := s.fetchProfileUpdate(ctx, p); err != nil {
+			results = append(results, refreshResult{ID: p.ID, Name: p.Name, OK: false, Error: err.Error()})
+			continue
+		}
+		results = append(results, refreshResult{ID: p.ID, Name: p.Name, OK: true})
+		if p.Active {
+			reloaded = true
+		}
+	}
+	s.refreshMu.Unlock()
+	return results, reloaded, nil
+}
+
+// patchMode switches the mihomo runtime mode (rule/global/direct) via the
+// controller API. It is a hot switch: the core keeps running and overrides
+// are untouched, mirroring clash-verge-rev's ClashModeCard behaviour.
+func (s *Server) patchMode(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Mode string `json:"mode"`
+	}
+	if !decodeJSON(w, r, &in, 64<<10) {
+		return
+	}
+	switch in.Mode {
+	case "rule", "global", "direct":
+	default:
+		writeError(w, 400, "mode must be rule, global or direct")
+		return
+	}
+	body := strings.NewReader(`{"mode":"` + in.Mode + `"}`)
+	data, code, err := s.request(s.mihomo, "PATCH", s.mihomoBase+"/configs", body, map[string]string{"Content-Type": "application/json"})
+	proxyResponse(w, data, code, err)
+}
+
+// subscriptionLoop refreshes remote profiles whose update interval elapsed.
+// One tick per minute is plenty: the smallest legal interval is 24 hours.
+func (s *Server) subscriptionLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			due, err := s.store.ProfilesDue(time.Now())
+			if err != nil {
+				log.Printf("scheduled subscription check failed: %v", err)
+				continue
+			}
+			for _, p := range due {
+				s.refreshMu.Lock()
+				_, err := s.fetchProfileUpdate(ctx, p)
+				s.refreshMu.Unlock()
+				if err != nil {
+					log.Printf("scheduled update of profile %q failed: %v", p.Name, err)
+				}
+			}
+		}
+	}
+}
+
+// fetchProfileUpdate downloads a remote profile, persists it and, when the
+// profile is active, reloads it through the helper. Callers must hold
+// refreshMu. Failures are recorded on the profile and returned.
+func (s *Server) fetchProfileUpdate(ctx context.Context, p Profile) (Profile, error) {
+	opt := s.fetchOptionsFor(p.Settings)
+	content, err := fetchSubscription(ctx, p.URL, s.cfg.AllowPrivateSubscriptionSources, opt)
+	if err != nil {
+		_ = s.store.SetProfileUpdateResult(p.ID, err.Error())
+		return p, err
+	}
+	p.Content = content
+	if err = s.store.UpdateProfile(p); err != nil {
+		_ = s.store.SetProfileUpdateResult(p.ID, err.Error())
+		return p, err
+	}
+	if p.Active {
+		data, code, activateErr := s.request(s.helper, "POST", s.helperBase+"/v1/config/validate-activate", strings.NewReader(p.Content), map[string]string{"Content-Type": "application/yaml"})
+		if activateErr != nil || code >= 400 {
+			errText := fmt.Sprintf("content updated but activation failed: %s", strings.TrimSpace(string(data)))
+			if activateErr != nil {
+				errText = fmt.Sprintf("content updated but activation failed: %v", activateErr)
+			}
+			_ = s.store.SetProfileUpdateResult(p.ID, errText)
+			return p, errors.New(errText)
+		}
+	}
+	if err = s.store.SetProfileUpdateResult(p.ID, ""); err != nil {
+		return p, err
+	}
+	updated, err := s.store.Profile(p.ID)
+	if err != nil {
+		return p, nil
+	}
+	return updated, nil
+}
+
+// fetchOptionsFor converts stored profile settings into fetch options,
+// resolving the local mihomo proxy port when the profile asks for it.
+func (s *Server) fetchOptionsFor(settings *ProfileSettings) fetchOptions {
+	opt := fetchOptions{}
+	if settings == nil {
+		return opt
+	}
+	if settings.TimeoutSeconds > 0 {
+		opt.Timeout = time.Duration(settings.TimeoutSeconds) * time.Second
+	}
+	if ua := strings.TrimSpace(settings.UserAgent); ua != "" {
+		opt.UserAgent = ua
+	}
+	if settings.WithProxy {
+		if port := s.localProxyPort(); port > 0 {
+			if u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port)); err == nil {
+				opt.ProxyURL = u
+			}
+		}
+	}
+	return opt
+}
+
+// localProxyPort asks the helper for the active mixed/port setting. It
+// returns 0 when unavailable; callers then fall back to a direct fetch.
+func (s *Server) localProxyPort() int {
+	data, code, err := s.request(s.helper, "GET", s.helperBase+"/v1/config/settings", nil, nil)
+	if err != nil || code >= 400 {
+		return 0
+	}
+	var settings map[string]any
+	if json.Unmarshal(data, &settings) != nil {
+		return 0
+	}
+	if port := proxyPortValue(settings["mixed-port"]); port > 0 {
+		return port
+	}
+	return proxyPortValue(settings["port"])
+}
+
+func proxyPortValue(value any) int {
+	switch value := value.(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	default:
+		return 0
+	}
+}
+
+// normalizeSettings validates and clamps per-profile subscription settings.
+// Intervals below the daily floor are raised rather than rejected, matching
+// clash-verge-rev's MIN_UPDATE_INTERVAL behaviour.
+func normalizeSettings(in *ProfileSettings) *ProfileSettings {
+	out := &ProfileSettings{
+		UserAgent:       strings.TrimSpace(in.UserAgent),
+		TimeoutSeconds:  in.TimeoutSeconds,
+		UpdateInterval:  in.UpdateInterval,
+		WithProxy:       in.WithProxy,
+		LastUpdateError: in.LastUpdateError,
+	}
+	if out.TimeoutSeconds < 0 || out.TimeoutSeconds > maxFetchTimeoutSeconds {
+		if out.TimeoutSeconds > maxFetchTimeoutSeconds {
+			out.TimeoutSeconds = maxFetchTimeoutSeconds
+		} else {
+			out.TimeoutSeconds = 0
+		}
+	}
+	if out.UpdateInterval < 0 {
+		out.UpdateInterval = 0
+	}
+	if out.UpdateInterval > 0 && out.UpdateInterval < minAutoUpdateMinutes {
+		out.UpdateInterval = minAutoUpdateMinutes
+	}
+	if len(out.UserAgent) > 512 {
+		out.UserAgent = out.UserAgent[:512]
+	}
+	if out.UserAgent != "" {
+		out.UserAgent = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}, out.UserAgent)
+	}
+	return out
 }
 func (s *Server) activateProfile(w http.ResponseWriter, r *http.Request) {
 	id, ok := paramID(w, r)

@@ -15,14 +15,25 @@ import (
 
 type Store struct{ db *sql.DB }
 
+// ProfileSettings holds per-profile subscription options, mirroring the
+// clash-verge-rev profile option fields that make sense for a server.
+type ProfileSettings struct {
+	UpdateInterval  int    `json:"updateInterval"`  // minutes; 0 disables scheduled updates
+	UserAgent       string `json:"userAgent"`       // empty = default "Clash.Meta"
+	TimeoutSeconds  int    `json:"timeoutSeconds"`  // 0 = default 25s
+	WithProxy       bool   `json:"withProxy"`       // fetch through the local mihomo port
+	LastUpdateError string `json:"lastUpdateError"` // outcome of the last refresh, cleared on success
+}
+
 type Profile struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Source    string `json:"source"`
-	URL       string `json:"url,omitempty"`
-	Active    bool   `json:"active"`
-	UpdatedAt string `json:"updatedAt"`
-	Content   string `json:"content,omitempty"`
+	ID        int64            `json:"id"`
+	Name      string           `json:"name"`
+	Source    string           `json:"source"`
+	URL       string           `json:"url,omitempty"`
+	Active    bool             `json:"active"`
+	UpdatedAt string           `json:"updatedAt"`
+	Content   string           `json:"content,omitempty"`
+	Settings  *ProfileSettings `json:"settings,omitempty"`
 }
 
 func OpenStore(dataDir string) (*Store, error) {
@@ -38,14 +49,60 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, source TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, source TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL, updated_at INTEGER NOT NULL, update_interval INTEGER NOT NULL DEFAULT 0, user_agent TEXT NOT NULL DEFAULT '', timeout_seconds INTEGER NOT NULL DEFAULT 0, with_proxy INTEGER NOT NULL DEFAULT 0, last_update_error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `)
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err = s.migrateProfiles(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+// migrateProfiles appends per-profile setting columns missing from databases
+// created before they existed. CREATE TABLE IF NOT EXISTS leaves an existing
+// table untouched, so this check runs on every open and is idempotent.
+func (s *Store) migrateProfiles() error {
+	rows, err := s.db.Query("PRAGMA table_info(profiles)")
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	additions := []struct{ column, definition string }{
+		{"update_interval", "INTEGER NOT NULL DEFAULT 0"},
+		{"user_agent", "TEXT NOT NULL DEFAULT ''"},
+		{"timeout_seconds", "INTEGER NOT NULL DEFAULT 0"},
+		{"with_proxy", "INTEGER NOT NULL DEFAULT 0"},
+		{"last_update_error", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, addition := range additions {
+		if existing[addition.column] {
+			continue
+		}
+		if _, err = s.db.Exec("ALTER TABLE profiles ADD COLUMN " + addition.column + " " + addition.definition); err != nil {
+			return fmt.Errorf("migrate profiles table: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -107,8 +164,10 @@ func (s *Store) DeleteSession(token string) {
 	_, _ = s.db.Exec("DELETE FROM sessions WHERE token_hash=?", hashToken(token))
 }
 
+const profileListColumns = "id,name,source,url,active,updated_at,update_interval,user_agent,timeout_seconds,with_proxy,last_update_error"
+
 func (s *Store) Profiles() ([]Profile, error) {
-	rows, err := s.db.Query("SELECT id,name,source,url,active,datetime(updated_at,'unixepoch') FROM profiles ORDER BY active DESC,id DESC")
+	rows, err := s.db.Query("SELECT " + profileListColumns + " FROM profiles ORDER BY active DESC,id DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -116,11 +175,18 @@ func (s *Store) Profiles() ([]Profile, error) {
 	result := make([]Profile, 0)
 	for rows.Next() {
 		var p Profile
-		var active int
-		if err := rows.Scan(&p.ID, &p.Name, &p.Source, &p.URL, &active, &p.UpdatedAt); err != nil {
+		var active, interval, timeout, withProxy int
+		var ts int64
+		settings := &ProfileSettings{}
+		if err := rows.Scan(&p.ID, &p.Name, &p.Source, &p.URL, &active, &ts, &interval, &settings.UserAgent, &timeout, &withProxy, &settings.LastUpdateError); err != nil {
 			return nil, err
 		}
 		p.Active = active != 0
+		p.UpdatedAt = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+		settings.UpdateInterval = interval
+		settings.TimeoutSeconds = timeout
+		settings.WithProxy = withProxy != 0
+		p.Settings = settings
 		result = append(result, p)
 	}
 	return result, rows.Err()
@@ -128,33 +194,55 @@ func (s *Store) Profiles() ([]Profile, error) {
 
 func (s *Store) Profile(id int64) (Profile, error) {
 	var p Profile
-	var active int
+	var active, interval, timeout, withProxy int
 	var ts int64
-	err := s.db.QueryRow("SELECT id,name,source,url,active,content,updated_at FROM profiles WHERE id=?", id).Scan(&p.ID, &p.Name, &p.Source, &p.URL, &active, &p.Content, &ts)
+	settings := &ProfileSettings{}
+	err := s.db.QueryRow("SELECT id,name,source,url,active,content,updated_at,update_interval,user_agent,timeout_seconds,with_proxy,last_update_error FROM profiles WHERE id=?", id).
+		Scan(&p.ID, &p.Name, &p.Source, &p.URL, &active, &p.Content, &ts, &interval, &settings.UserAgent, &timeout, &withProxy, &settings.LastUpdateError)
 	p.Active = active != 0
 	p.UpdatedAt = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+	settings.UpdateInterval = interval
+	settings.TimeoutSeconds = timeout
+	settings.WithProxy = withProxy != 0
+	p.Settings = settings
 	return p, err
 }
 
 func (s *Store) CreateProfile(p Profile) (Profile, error) {
 	now := time.Now().Unix()
-	res, err := s.db.Exec("INSERT INTO profiles(name,source,url,content,updated_at) VALUES(?,?,?,?,?)", p.Name, p.Source, p.URL, p.Content, now)
+	settings := p.Settings
+	if settings == nil {
+		settings = &ProfileSettings{}
+	}
+	res, err := s.db.Exec("INSERT INTO profiles(name,source,url,content,updated_at,update_interval,user_agent,timeout_seconds,with_proxy,last_update_error) VALUES(?,?,?,?,?,?,?,?,?,?)",
+		p.Name, p.Source, p.URL, p.Content, now, settings.UpdateInterval, settings.UserAgent, settings.TimeoutSeconds, boolInt(settings.WithProxy), settings.LastUpdateError)
 	if err != nil {
 		return p, err
 	}
 	p.ID, _ = res.LastInsertId()
 	p.UpdatedAt = time.Unix(now, 0).UTC().Format(time.RFC3339)
+	p.Settings = settings
 	return p, nil
 }
 
+// UpdateProfile persists an edited profile. A nil Settings value leaves the
+// stored subscription options untouched so YAML-only edits cannot wipe them.
 func (s *Store) UpdateProfile(p Profile) error {
-	_, err := s.db.Exec("UPDATE profiles SET name=?,url=?,content=?,updated_at=? WHERE id=?", p.Name, p.URL, p.Content, time.Now().Unix(), p.ID)
+	if p.Settings == nil {
+		_, err := s.db.Exec("UPDATE profiles SET name=?,url=?,content=?,updated_at=? WHERE id=?", p.Name, p.URL, p.Content, time.Now().Unix(), p.ID)
+		return err
+	}
+	settings := p.Settings
+	_, err := s.db.Exec("UPDATE profiles SET name=?,url=?,content=?,updated_at=?,update_interval=?,user_agent=?,timeout_seconds=?,with_proxy=? WHERE id=?",
+		p.Name, p.URL, p.Content, time.Now().Unix(), settings.UpdateInterval, settings.UserAgent, settings.TimeoutSeconds, boolInt(settings.WithProxy), p.ID)
 	return err
 }
+
 func (s *Store) DeleteProfile(id int64) error {
 	_, err := s.db.Exec("DELETE FROM profiles WHERE id=?", id)
 	return err
 }
+
 func (s *Store) ActivateProfile(id int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -168,6 +256,37 @@ func (s *Store) ActivateProfile(id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ProfilesDue returns remote profiles whose scheduled update time has passed.
+// See SetProfileUpdateResult for why failures also count as "updated".
+func (s *Store) ProfilesDue(now time.Time) ([]Profile, error) {
+	all, err := s.Profiles()
+	if err != nil {
+		return nil, err
+	}
+	due := make([]Profile, 0, len(all))
+	for _, p := range all {
+		if p.URL == "" || p.Settings == nil || p.Settings.UpdateInterval <= 0 {
+			continue
+		}
+		updated, err := time.Parse(time.RFC3339, p.UpdatedAt)
+		if err != nil {
+			continue
+		}
+		if now.Sub(updated) >= time.Duration(p.Settings.UpdateInterval)*time.Minute {
+			due = append(due, p)
+		}
+	}
+	return due, nil
+}
+
+// SetProfileUpdateResult records the outcome of a refresh. updated_at always
+// advances: a failed fetch must push the next attempt a full interval away,
+// otherwise ProfilesDue would fire again on the next tick and spin.
+func (s *Store) SetProfileUpdateResult(id int64, errText string) error {
+	_, err := s.db.Exec("UPDATE profiles SET last_update_error=?,updated_at=? WHERE id=?", errText, time.Now().Unix(), id)
+	return err
 }
 
 func (s *Store) Setting(key string) (string, error) {
