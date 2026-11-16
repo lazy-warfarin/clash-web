@@ -13,9 +13,12 @@ FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS app-builder
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
+# Pipes separate fallbacks that are tried on any error (not just 404/410), so a
+# flaky upstream module proxy does not fail the build outright.
+ENV GOPROXY=https://proxy.golang.org|https://goproxy.io|direct
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN for attempt in 1 2 3; do go mod download && exit 0; sleep 5; done; exit 1
 COPY cmd ./cmd
 COPY internal ./internal
 COPY --from=ui-builder /src/internal/webassets/dist ./internal/webassets/dist
@@ -28,12 +31,16 @@ FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS mihomo-builder
 ARG MIHOMO_VERSION=v1.19.33
 ARG MIHOMO_COMMIT=3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8
 ARG TARGETARCH
+ENV GOPROXY=https://proxy.golang.org|https://goproxy.io|direct
 WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch "${MIHOMO_VERSION}" https://github.com/MetaCubeX/mihomo.git . \
     && test "$(git rev-parse HEAD)" = "${MIHOMO_COMMIT}"
+# Fetch modules separately so a transient proxy error is retried instead of
+# aborting the long compile step.
+RUN for attempt in 1 2 3; do go mod download && exit 0; sleep 5; done; exit 1
 RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" go build \
     -tags with_gvisor \
     -trimpath \
