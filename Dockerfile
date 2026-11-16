@@ -9,7 +9,7 @@ COPY ui ./ui
 COPY internal/webassets ./internal/webassets
 RUN pnpm --dir ui build
 
-FROM --platform=$BUILDPLATFORM golang:1.26.4-bookworm AS app-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS app-builder
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
@@ -24,9 +24,9 @@ RUN CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" go build \
     -ldflags="-s -w -buildid= -X main.version=${VERSION}" \
     -o /out/clash-web ./cmd/clash-web
 
-FROM --platform=$BUILDPLATFORM golang:1.26.4-bookworm AS mihomo-builder
-ARG MIHOMO_VERSION=v1.19.27
-ARG MIHOMO_COMMIT=5184081ac327394d9e15fa5d5f9f4a61e723fd94
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS mihomo-builder
+ARG MIHOMO_VERSION=v1.19.33
+ARG MIHOMO_COMMIT=3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8
 ARG TARGETARCH
 WORKDIR /src
 RUN apt-get update \
