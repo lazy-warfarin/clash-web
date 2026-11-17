@@ -251,23 +251,36 @@ function formatDelay(testing: boolean, delay: number) {
 
 function ProfilesPage() {
   const qc = useQueryClient(); const [open, setOpen] = useState(false); const [editing, setEditing] = useState<Profile | null>(null); const [message, setMessage] = useState(''); const [error, setError] = useState('')
-  const profiles = useQuery<{ profiles: Profile[] }>({ queryKey: ['profiles'], queryFn: () => api('/profiles/') })
+  const [settingsProfile, setSettingsProfile] = useState<Profile | null>(null)
+  const profiles = useQuery<{ profiles: Profile[] }>({ queryKey: ['profiles'], queryFn: () => api('/profiles/'), refetchInterval: 30000 })
   const activate = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/activate`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); qc.invalidateQueries({ queryKey: ['status'] }); setMessage('配置已验证并启用') }, onError: e => setError((e as Error).message) })
   const remove = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}`, { method: 'DELETE' }), onSuccess: () => qc.invalidateQueries({ queryKey: ['profiles'] }) })
   const refresh = useMutation({ mutationFn: (id: number) => api(`/profiles/${id}/refresh`, { method: 'POST' }), onSuccess: () => { qc.invalidateQueries({ queryKey: ['profiles'] }); qc.invalidateQueries({ queryKey: ['status'] }); setMessage('订阅已更新') }, onError: e => { qc.invalidateQueries({ queryKey: ['profiles'] }); setError(`订阅更新失败：${(e as Error).message}`) } })
   const loadEditor = async (p: Profile) => setEditing(await api(`/profiles/${p.id}`))
+  const openSettings = async (p: Profile) => {
+    try {
+      setSettingsProfile(await api<Profile>(`/profiles/${p.id}`))
+    } catch (e) { setError(`读取订阅设置失败：${(e as Error).message}`) }
+  }
   return <><Stack spacing={2}><PageTools title="配置与订阅" action={<Button variant="contained" startIcon={<AddRounded />} onClick={() => setOpen(true)}>新建订阅</Button>} />
     <Box className="profile-grid">{(profiles.data?.profiles || []).map(p => {
-      const nextUpdate = p.settings?.updateInterval ? new Date(new Date(p.updatedAt).getTime() + p.settings.updateInterval * 60000) : null
+      const autoUpdate = !!p.url && (p.settings?.updateInterval || 0) > 0
+      const nextUpdate = autoUpdate ? nextProfileUpdate(p.updatedAt, p.settings!.updateInterval) : null
       return <Card key={p.id} className={p.active ? 'profile-card active' : 'profile-card'}><CardContent>
-      <Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box className="profile-icon"><DnsRounded /></Box><Stack direction="row" spacing={.5}>{p.settings?.updateInterval ? <Tooltip title={`下次自动更新：${displayTime(nextUpdate!.toISOString())}`}><Chip size="small" label={`每 ${p.settings.updateInterval} 分钟`} variant="outlined" /></Tooltip> : null}{p.settings?.withProxy ? <Tooltip title="通过本机代理下载"><Chip size="small" label="代理" variant="outlined" /></Tooltip> : null}<Chip size="small" label={p.active ? 'ACTIVE' : p.source.toUpperCase()} color={p.active ? 'primary' : 'default'} /></Stack></Stack>
+      <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}><Box className="profile-icon"><DnsRounded /></Box><Stack direction="row" spacing={.5} useFlexGap flexWrap="wrap" justifyContent="flex-end">{p.url && <Chip size="small" label={autoUpdate ? `自动更新 · 每 ${p.settings!.updateInterval} 分钟` : '自动更新已关闭'} color={autoUpdate ? 'primary' : 'default'} variant="outlined" />}{p.settings?.withProxy ? <Tooltip title="通过本机代理下载"><Chip size="small" label="代理" variant="outlined" /></Tooltip> : null}<Chip size="small" label={p.active ? 'ACTIVE' : p.source.toUpperCase()} color={p.active ? 'primary' : 'default'} /></Stack></Stack>
       <Typography variant="h6" sx={{ mt: 2 }}>{p.name}</Typography><Typography variant="body2" color="text.secondary" noWrap>{p.url || '本地 YAML 配置'}</Typography><Typography variant="caption" color="text.secondary">更新于 {displayTime(p.updatedAt)}</Typography>
+      {nextUpdate && <Typography variant="caption" color="text.secondary" display="block">下次自动更新：{displayTime(nextUpdate)}</Typography>}
       {p.settings?.lastUpdateError && <Alert severity="error" sx={{ mt: 1 }}>上次更新失败：{p.settings.lastUpdateError}</Alert>}
-      <Divider sx={{ my: 2 }} /><Stack direction="row" spacing={.5}><Tooltip title="启用"><IconButton color={p.active ? 'primary' : 'default'} onClick={() => activate.mutate(p.id)}><PlayArrowRounded /></IconButton></Tooltip>{p.url && <Tooltip title="更新"><IconButton onClick={() => refresh.mutate(p.id)} disabled={refresh.isPending}><CloudDownloadRounded /></IconButton></Tooltip>}<Tooltip title="编辑"><IconButton onClick={() => loadEditor(p)}><EditRounded /></IconButton></Tooltip><Box flex={1}/><Tooltip title="删除"><IconButton color="error" onClick={() => remove.mutate(p.id)}><DeleteOutlineRounded /></IconButton></Tooltip></Stack>
+      <Divider sx={{ my: 2 }} /><Stack direction="row" spacing={.5}><Tooltip title="启用"><IconButton color={p.active ? 'primary' : 'default'} onClick={() => activate.mutate(p.id)}><PlayArrowRounded /></IconButton></Tooltip>{p.url && <Tooltip title="更新"><IconButton onClick={() => refresh.mutate(p.id)} disabled={refresh.isPending}><CloudDownloadRounded /></IconButton></Tooltip>}<Tooltip title="编辑 YAML"><IconButton onClick={() => loadEditor(p)}><EditRounded /></IconButton></Tooltip><Tooltip title="订阅设置"><IconButton aria-label={`${p.name}的订阅设置`} onClick={() => openSettings(p)}><SettingsRounded /></IconButton></Tooltip><Box flex={1}/><Tooltip title="删除"><IconButton color="error" onClick={() => remove.mutate(p.id)}><DeleteOutlineRounded /></IconButton></Tooltip></Stack>
     </CardContent></Card>})}</Box>
     {!profiles.data?.profiles.length && <EmptyGuide title="还没有订阅" detail="从 URL 导入，或粘贴一份 mihomo YAML 配置开始使用。" action={<Button variant="contained" onClick={() => setOpen(true)}>添加第一个配置</Button>} />}</Stack>
     <ProfileDialog open={open} onClose={() => setOpen(false)} onSaved={() => { setOpen(false); qc.invalidateQueries({ queryKey: ['profiles'] }) }} />
     <EditorDialog profile={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); qc.invalidateQueries({ queryKey: ['profiles'] }) }} />
+    {settingsProfile && <ProfileSettingsDialog key={settingsProfile.id} profile={settingsProfile} onClose={() => setSettingsProfile(null)} onSaved={settings => {
+      setSettingsProfile(null)
+      qc.invalidateQueries({ queryKey: ['profiles'] })
+      setMessage(`「${settingsProfile.name}」设置已保存，${settings.updateInterval > 0 ? `每 ${settings.updateInterval} 分钟自动更新` : '已关闭定期更新'}`)
+    }} />}
     <Snackbar open={!!message} autoHideDuration={2600} onClose={() => setMessage('')} message={message} />
     <Snackbar open={!!error} autoHideDuration={4500} onClose={() => setError('')} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}><Alert onClose={() => setError('')} severity="error" variant="filled">{error}</Alert></Snackbar>
   </>
@@ -483,19 +496,106 @@ function CurrentConfigDialog({ content, setContent, onSave }: { content: string 
 
 const MIN_UPDATE_INTERVAL = 1440
 
+type ProfileSettingsDraft = {
+  autoUpdate: boolean
+  updateInterval: string
+  userAgent: string
+  timeoutSeconds: string
+  withProxy: boolean
+}
+
+function profileSettingsDraft(settings?: ProfileSettings): ProfileSettingsDraft {
+  return {
+    autoUpdate: (settings?.updateInterval || 0) > 0,
+    updateInterval: String(settings?.updateInterval || MIN_UPDATE_INTERVAL),
+    userAgent: settings?.userAgent || '',
+    timeoutSeconds: String(settings?.timeoutSeconds || 0),
+    withProxy: !!settings?.withProxy,
+  }
+}
+
+function profileSettingsDraftError(draft: ProfileSettingsDraft) {
+  const interval = Number(draft.updateInterval)
+  if (draft.autoUpdate && (!draft.updateInterval.trim() || !Number.isSafeInteger(interval) || interval <= 0 || interval > 153722867)) return '更新间隔需为有效的正整数分钟'
+  const timeout = Number(draft.timeoutSeconds)
+  if (!Number.isInteger(timeout) || timeout < 0 || timeout > 120) return '下载超时需为 0～120 之间的整数秒'
+  return ''
+}
+
+function settingsFromDraft(draft: ProfileSettingsDraft): ProfileSettings {
+  return {
+    updateInterval: draft.autoUpdate ? Number(draft.updateInterval) : 0,
+    userAgent: draft.userAgent,
+    timeoutSeconds: Number(draft.timeoutSeconds),
+    withProxy: draft.withProxy,
+  }
+}
+
+function nextProfileUpdate(updatedAt: string, interval: number) {
+  const timestamp = new Date(updatedAt).getTime() + interval * 60000
+  const next = new Date(timestamp)
+  return Number.isFinite(next.getTime()) ? next.toISOString() : null
+}
+
+// Shared by subscription creation and each existing subscription's settings.
+// The switch is explicit in the UI; updateInterval=0 remains the persisted off
+// state, keeping existing subscriptions and databases compatible.
+function ProfileSettingsFields({ value, onChange, disabled = false }: { value: ProfileSettingsDraft; onChange: (value: ProfileSettingsDraft) => void; disabled?: boolean }) {
+  const interval = Number(value.updateInterval)
+  const invalidInterval = value.autoUpdate && (!value.updateInterval.trim() || !Number.isSafeInteger(interval) || interval <= 0 || interval > 153722867)
+  const tooFrequent = value.autoUpdate && !invalidInterval && interval < MIN_UPDATE_INTERVAL
+  const timeout = Number(value.timeoutSeconds)
+  const invalidTimeout = !Number.isInteger(timeout) || timeout < 0 || timeout > 120
+  return <Stack component="fieldset" disabled={disabled} spacing={2} sx={{ m: 0, p: 0, border: 0, minWidth: 0 }}>
+    <SettingSwitch title="定期自动更新" detail="仅对此订阅生效；由服务器执行，关闭浏览器后仍会按时更新" checked={value.autoUpdate} onChange={autoUpdate => onChange({ ...value, autoUpdate })}/>
+    <TextField label="自动更新间隔（分钟）" type="number" value={value.updateInterval} disabled={disabled || !value.autoUpdate} error={invalidInterval} inputProps={{ min: 1, max: 153722867, step: 1 }}
+      helperText={invalidInterval ? '请输入有效的正整数分钟' : !value.autoUpdate ? '已关闭定期更新；开启后按此间隔执行' : tooFrequent ? `间隔不足 24 小时，保存时会调整为 ${MIN_UPDATE_INTERVAL} 分钟` : '1440 分钟 = 24 小时；最短间隔为 24 小时'}
+      FormHelperTextProps={{ sx: tooFrequent ? { color: 'warning.main' } : undefined }}
+      onChange={e => onChange({ ...value, updateInterval: e.target.value })}/>
+    <Divider>下载选项</Divider>
+    <TextField label="User-Agent" value={value.userAgent} placeholder="默认 Clash.Meta" inputProps={{ maxLength: 512 }} onChange={e => onChange({ ...value, userAgent: e.target.value })}/>
+    <TextField label="下载超时（秒）" type="number" value={value.timeoutSeconds} error={invalidTimeout} inputProps={{ min: 0, max: 120, step: 1 }} helperText={invalidTimeout ? '请输入 0～120 之间的整数秒' : '0 或留空使用默认 25 秒，最大 120 秒'} onChange={e => onChange({ ...value, timeoutSeconds: e.target.value })}/>
+    <SettingSwitch title="通过本机代理下载" detail="拉取此订阅时使用服务器上的 mihomo 代理端口" checked={value.withProxy} onChange={withProxy => onChange({ ...value, withProxy })}/>
+  </Stack>
+}
+
+function ProfileSettingsDialog({ profile, onClose, onSaved }: { profile: Profile; onClose: () => void; onSaved: (settings: ProfileSettings) => void }) {
+  const [draft, setDraft] = useState(() => profileSettingsDraft(profile.settings))
+  const local = !profile.url
+  const nextUpdate = profile.settings?.updateInterval ? nextProfileUpdate(profile.updatedAt, profile.settings.updateInterval) : null
+  const save = useMutation({
+    mutationFn: () => api<ProfileSettings>(`/profiles/${profile.id}/settings`, json('PATCH', settingsFromDraft(draft))),
+    onSuccess: onSaved,
+  })
+  const close = () => { if (!save.isPending) onClose() }
+  return <Dialog open onClose={close} fullWidth maxWidth="sm" aria-labelledby="profile-settings-title">
+    <DialogTitle id="profile-settings-title">订阅设置 · {profile.name}</DialogTitle>
+    <DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
+      {local ? <Alert severity="info">此配置来自本地 YAML，没有远程订阅地址，不能定期下载更新。</Alert> : <Typography variant="body2" color="text.secondary">每个订阅独立保存。更改这些设置不会修改 YAML 内容或重新启动内核。</Typography>}
+      <ProfileSettingsFields value={draft} onChange={value => { save.reset(); setDraft(value) }} disabled={local || save.isPending}/>
+      {!local && nextUpdate && <Typography variant="caption" color="text.secondary">已保存设置的下次执行时间：{displayTime(nextUpdate)}。修改间隔后从上次更新尝试时间重新计算，已到期的订阅会在一分钟内检查更新。</Typography>}
+      {save.error && <Alert severity="error">保存失败：{(save.error as Error).message}</Alert>}
+    </Stack></DialogContent>
+    <DialogActions><Button onClick={close} disabled={save.isPending}>{local ? '关闭' : '取消'}</Button>{!local && <Button variant="contained" onClick={() => save.mutate()} disabled={save.isPending || !!profileSettingsDraftError(draft)}>{save.isPending ? '正在保存…' : '保存设置'}</Button>}</DialogActions>
+  </Dialog>
+}
+
 function ProfileDialog({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: () => void }) {
   const [value, setValue] = useState({ name: '', url: '', content: '', source: 'remote' })
-  const [settings, setSettings] = useState<ProfileSettings>({ updateInterval: 0, userAgent: '', timeoutSeconds: 0, withProxy: false })
+  const [settings, setSettings] = useState(() => profileSettingsDraft())
   const [error, setError] = useState('')
-  const interval = Number(settings.updateInterval) || 0
-  const tooFrequent = interval > 0 && interval < MIN_UPDATE_INTERVAL
+  const [saving, setSaving] = useState(false)
   const save = async () => {
+    if (saving || (value.url && profileSettingsDraftError(settings))) return
+    setSaving(true)
+    setError('')
     try {
-      await api('/profiles/', json('POST', { ...value, settings }))
+      await api('/profiles/', json('POST', { ...value, settings: value.url ? settingsFromDraft(settings) : { updateInterval: 0 } }))
       setValue({ name: '', url: '', content: '', source: 'remote' })
-      setSettings({ updateInterval: 0, userAgent: '', timeoutSeconds: 0, withProxy: false })
+      setSettings(profileSettingsDraft())
       onSaved()
     } catch (e) { setError((e as Error).message) }
+    finally { setSaving(false) }
   }
   const chooseFile = async (file?: File) => { if (!file) return; if (file.size > 20 * 1024 * 1024) { setError('配置文件不能超过 20 MiB'); return }; const content = await file.text(); setValue(v => ({ ...v, name: v.name || file.name.replace(/\.ya?ml$/i, ''), content, url: '', source: 'local' })) }
   return <Dialog open={open} onClose={onClose} fullWidth maxWidth="md"><DialogTitle>添加配置</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
@@ -504,17 +604,9 @@ function ProfileDialog({ open, onClose, onSaved }: { open: boolean; onClose: () 
     <Divider>或导入本地 YAML</Divider>
     <Button component="label" variant="outlined" startIcon={<UploadFileRounded />}>选择 YAML 文件<input hidden type="file" accept=".yaml,.yml,text/yaml" onChange={e => chooseFile(e.target.files?.[0])}/></Button>
     <TextField multiline minRows={10} label="mihomo YAML" value={value.content} onChange={e => setValue(v => ({ ...v, content: e.target.value, url: '', source: 'local' }))} InputProps={{ sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } }}/>
-    {value.url !== '' && <><Divider>订阅设置</Divider>
-      <TextField label="自动更新间隔（分钟）" type="number" value={settings.updateInterval} inputProps={{ min: 0 }}
-        helperText={tooFrequent ? `间隔低于 ${MIN_UPDATE_INTERVAL} 分钟（24 小时）会被调整为 ${MIN_UPDATE_INTERVAL}` : '留空或 0 表示不自动更新'}
-        FormHelperTextProps={{ sx: tooFrequent ? { color: 'warning.main' } : undefined }}
-        onChange={e => setSettings(s => ({ ...s, updateInterval: Number(e.target.value) || 0 }))}/>
-      <TextField label="User-Agent" value={settings.userAgent || ''} placeholder="默认 Clash.Meta" onChange={e => setSettings(s => ({ ...s, userAgent: e.target.value }))}/>
-      <TextField label="下载超时（秒）" type="number" value={settings.timeoutSeconds} inputProps={{ min: 0, max: 120 }} helperText="0 表示默认 25 秒，最大 120" onChange={e => setSettings(s => ({ ...s, timeoutSeconds: Number(e.target.value) || 0 }))}/>
-      <SettingSwitch title="通过本机代理下载" detail="拉取订阅时走 mihomo 混合端口，订阅服务器需要代理可达时开启" checked={!!settings.withProxy} onChange={withProxy => setSettings(s => ({ ...s, withProxy }))}/>
-    </>}
+    {value.url !== '' && <><Divider>订阅设置</Divider><ProfileSettingsFields value={settings} onChange={setSettings} disabled={saving}/></>}
     {error && <Alert severity="error">{error}</Alert>}
-  </Stack></DialogContent><DialogActions><Button onClick={onClose}>取消</Button><Button variant="contained" onClick={save} disabled={!value.name || (!value.url && !value.content)}>保存配置</Button></DialogActions></Dialog>
+  </Stack></DialogContent><DialogActions><Button onClick={onClose} disabled={saving}>取消</Button><Button variant="contained" onClick={save} disabled={saving || !value.name || (!value.url && !value.content) || (!!value.url && !!profileSettingsDraftError(settings))}>{saving ? '正在保存…' : '保存配置'}</Button></DialogActions></Dialog>
 }
 
 function EditorDialog({ profile, onClose, onSaved }: { profile: Profile | null; onClose: () => void; onSaved: () => void }) {

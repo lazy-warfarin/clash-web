@@ -137,6 +137,7 @@ func (s *Server) routes() http.Handler {
 				r.Post("/refresh-all", s.refreshAllProfiles)
 				r.Get("/{id}", s.getProfile)
 				r.Put("/{id}", s.updateProfile)
+				r.Patch("/{id}/settings", s.patchProfileSettings)
 				r.Delete("/{id}", s.deleteProfile)
 				r.Post("/{id}/activate", s.activateProfile)
 				r.Post("/{id}/refresh", s.refreshProfile)
@@ -409,6 +410,8 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	p, err := s.store.Profile(id)
 	if err != nil {
 		writeError(w, 404, "profile not found")
@@ -436,6 +439,69 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
+
+// patchProfileSettings deliberately accepts only editable settings, not a full
+// Profile: changing an update schedule must never require resubmitting its YAML.
+func (s *Server) patchProfileSettings(w http.ResponseWriter, r *http.Request) {
+	id, ok := paramID(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		UpdateInterval *int    `json:"updateInterval"`
+		UserAgent      *string `json:"userAgent"`
+		TimeoutSeconds *int    `json:"timeoutSeconds"`
+		WithProxy      *bool   `json:"withProxy"`
+	}
+	if !decodeJSON(w, r, &in, 64<<10) {
+		return
+	}
+	if in.UpdateInterval == nil && in.UserAgent == nil && in.TimeoutSeconds == nil && in.WithProxy == nil {
+		writeError(w, 400, "no subscription settings provided")
+		return
+	}
+	if in.UpdateInterval != nil && (*in.UpdateInterval < 0 || int64(*in.UpdateInterval) > int64((1<<63-1)/time.Minute)) {
+		writeError(w, 400, "update interval must be a non-negative number of minutes within the supported duration")
+		return
+	}
+
+	// The scheduler and refresh handlers use this same lock before loading a
+	// profile, so a queued refresh cannot restore settings that were just saved.
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	p, err := s.store.Profile(id)
+	if err != nil {
+		writeError(w, 404, "profile not found")
+		return
+	}
+	if p.URL == "" {
+		writeError(w, 400, "local configurations do not have a subscription URL to update")
+		return
+	}
+	settings := ProfileSettings{}
+	if p.Settings != nil {
+		settings = *p.Settings
+	}
+	if in.UpdateInterval != nil {
+		settings.UpdateInterval = *in.UpdateInterval
+	}
+	if in.UserAgent != nil {
+		settings.UserAgent = *in.UserAgent
+	}
+	if in.TimeoutSeconds != nil {
+		settings.TimeoutSeconds = *in.TimeoutSeconds
+	}
+	if in.WithProxy != nil {
+		settings.WithProxy = *in.WithProxy
+	}
+	normalized := normalizeSettings(&settings)
+	if err = s.store.UpdateProfileSettings(id, *normalized); err != nil {
+		writeError(w, 500, "unable to save subscription settings")
+		return
+	}
+	writeJSON(w, 200, normalized)
+}
+
 func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
 	id, ok := paramID(w, r)
 	if !ok {
@@ -452,14 +518,14 @@ func (s *Server) refreshProfile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	p, err := s.store.Profile(id)
 	if err != nil || p.URL == "" {
 		writeError(w, 400, "profile has no remote URL")
 		return
 	}
-	s.refreshMu.Lock()
 	updated, err := s.fetchProfileUpdate(r.Context(), p)
-	s.refreshMu.Unlock()
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
@@ -488,6 +554,8 @@ func (s *Server) refreshAllProfiles(w http.ResponseWriter, r *http.Request) {
 // refreshAll downloads every remote profile serially and reports per-profile
 // outcomes plus whether the active profile was reloaded.
 func (s *Server) refreshAll(ctx context.Context) ([]refreshResult, bool, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	profiles, err := s.store.Profiles()
 	if err != nil {
 		return nil, false, err
@@ -503,7 +571,6 @@ func (s *Server) refreshAll(ctx context.Context) ([]refreshResult, bool, error) 
 	}
 	results := make([]refreshResult, 0, len(remote))
 	reloaded := false
-	s.refreshMu.Lock()
 	for _, p := range remote {
 		if _, err := s.fetchProfileUpdate(ctx, p); err != nil {
 			results = append(results, refreshResult{ID: p.ID, Name: p.Name, OK: false, Error: err.Error()})
@@ -514,7 +581,6 @@ func (s *Server) refreshAll(ctx context.Context) ([]refreshResult, bool, error) 
 			reloaded = true
 		}
 	}
-	s.refreshMu.Unlock()
 	return results, reloaded, nil
 }
 
@@ -549,21 +615,31 @@ func (s *Server) subscriptionLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			due, err := s.store.ProfilesDue(time.Now())
-			if err != nil {
+			if err := s.refreshDueProfiles(ctx, time.Now()); err != nil {
 				log.Printf("scheduled subscription check failed: %v", err)
-				continue
-			}
-			for _, p := range due {
-				s.refreshMu.Lock()
-				_, err := s.fetchProfileUpdate(ctx, p)
-				s.refreshMu.Unlock()
-				if err != nil {
-					log.Printf("scheduled update of profile %q failed: %v", p.Name, err)
-				}
 			}
 		}
 	}
+}
+
+// Load the due list under the same lock as settings writes. Disabling scheduled
+// updates while this tick is queued must take effect before it fetches anything.
+func (s *Server) refreshDueProfiles(ctx context.Context, now time.Time) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	due, err := s.store.ProfilesDue(now)
+	if err != nil {
+		return err
+	}
+	for _, p := range due {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := s.fetchProfileUpdate(ctx, p); err != nil {
+			log.Printf("scheduled update of profile %q failed: %v", p.Name, err)
+		}
+	}
+	return nil
 }
 
 // fetchProfileUpdate downloads a remote profile, persists it and, when the

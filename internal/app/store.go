@@ -238,6 +238,25 @@ func (s *Store) UpdateProfile(p Profile) error {
 	return err
 }
 
+// UpdateProfileSettings changes only subscription options. Saving settings must
+// not overwrite downloaded YAML, activation state, the last error or the last
+// refresh time. Scheduling continues from that refresh time, even after restart.
+func (s *Store) UpdateProfileSettings(id int64, settings ProfileSettings) error {
+	result, err := s.db.Exec("UPDATE profiles SET update_interval=?,user_agent=?,timeout_seconds=?,with_proxy=? WHERE id=?",
+		settings.UpdateInterval, settings.UserAgent, settings.TimeoutSeconds, boolInt(settings.WithProxy), id)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) DeleteProfile(id int64) error {
 	_, err := s.db.Exec("DELETE FROM profiles WHERE id=?", id)
 	return err
