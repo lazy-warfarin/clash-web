@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/go-chi/chi/v5 v5.5.0
+	github.com/go-chi/chi/v5 v5.5.1-0.20261018133412-04f7f55a7b5d
 	github.com/go-chi/cors v1.2.2
 	golang.org/x/crypto v0.59.0
 	gopkg.in/yaml.v3 v3.0.1

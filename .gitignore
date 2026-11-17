@@ -9,3 +9,4 @@
 *.db-wal
 *.deb
 /.idea/
+/tmp/
